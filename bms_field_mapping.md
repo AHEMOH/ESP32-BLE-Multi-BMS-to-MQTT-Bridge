@@ -318,6 +318,66 @@ Frischer PowerQueen-Frame (Schalter weiterhin OFF):
 - OFF-Signatur unveraendert stabil:
   - `u16_le@68 = 128`
   - `s32_le@48 = 0`
+
+## 9) Command-Check fuer 0x10 / 0x16 / 0x41 / 0x43
+
+Status per 2026-04-10:
+
+| CMD | Request-Frame (8 Byte) | Zweck | Extern bestaetigt | In diesem YAML aktiv |
+|---|---|---|---|---|
+| `0x10` | `00 00 04 01 10 55 AA 14` | Serial Number | ja | nein |
+| `0x16` | `00 00 04 01 16 55 AA 1A` | Firmware Version | ja | nein |
+| `0x41` | `00 00 04 01 41 55 AA 45` | SOH/SOC (separat) | ja | nein |
+| `0x43` | `00 00 04 01 43 55 AA 47` | Nominal Capacity | ja | nein |
+
+Hinweis zur aktuellen Implementierung:
+
+- In `bms_bt_mqtt.yaml` wird derzeit nur `0x13` gesendet:
+  - `00 00 04 01 13 55 AA 17`
+- Die vier Kommandos sind dokumentiert und in externen Projekten belegt,
+  aber in diesem Projekt noch nicht aktiv gepollt.
+
+## 10) Auswertung der zwei bereitgestellten Beispiel-Frames
+
+Eingangsdaten:
+
+- `PQ`: `000065019355AA008B370000343600008F0D940D880D890D000000000000000000000000000000000000000000000000000000001A001A000000000000004A274A2700004800000004000000000000000000000000000000000064006400000001000000BF00000076`
+- `LI`: `000065019355AA00D236000026360000860D9C0D700D940D000000000000000000000000000000000000000000000000000000001A00190000000000000069276927000048000000040000000000000000000000040000000000640064000000010000006B0000008D`
+
+Validierung:
+
+- Beide Frames haben exakt `105` Byte.
+- Beide Checksummen sind korrekt (`PQ: 0x76`, `LI: 0x8D`).
+- Marker `byte[2] == 0x65` ist bei beiden gesetzt (Statusframe).
+
+Dekodierte Kerndaten (nach aktuellem Mapping):
+
+| Feld | PQ | LI | Kommentar |
+|---|---:|---:|---|
+| `u32@8` pack_voltage_mv_raw | `14219` | `14034` | plausibel |
+| `u32@12` pack_voltage_mv_alt | `13876` | `13862` | variant/offen |
+| `cell1..4 mV` | `3471/3476/3464/3465` | `3462/3484/3440/3476` | plausibel |
+| `s32@48` current_raw | `0` | `0` | no-load |
+| `u16@52/@54` temp | `26/26` | `26/25` | plausibel |
+| `u16@62` remain_ah_raw | `10058` | `10089` | konsistent |
+| `u16@64` factory_ah_raw | `10058` | `10089` | konsistent |
+| `u32@68` status_flags | `0x00000048` | `0x00000048` | Bit `0x80` nicht gesetzt |
+| `discharge_switch` (abgeleitet) | `ON` | `ON` | aus `status_flags@68` |
+| `u32@76` protect_state_raw | `0` | `0` | unauffaellig |
+| `u32@80` failure_state_raw | `0` | `0` | unauffaellig |
+| `u32@84` equil_state | `0` | `4` | LI zeigt aktive/nonzero Signatur |
+| `u16@88` operating_mode_raw | `0` | `0` | Idle/Standby-typisch |
+| `u16@90` soc_pct | `100` | `100` | konsistent |
+| `u16@92` soh_pct | `100` | `100` | konsistent |
+| `u32@96` cycle_count | `1` | `1` | konsistent |
+| `u32@100` discharged_ah_total | `191` | `107` | plausibel als Zaehler |
+
+Fazit zu den zwei Frames:
+
+- Sie bestaetigen das aktuelle `0x13`-Statusmapping sehr gut.
+- Sie liefern keine direkte Antwort auf die Payloads von `0x10/0x16/0x41/0x43`,
+  da beide Frames bereits `0x65`-Statusantworten sind.
+- Fuer die vier Zusatzkommandos braucht es gezielte Request/Response-Captures je CMD.
   - `u16_le@62 = 8867`, `u16_le@64 = 10058`
   - `u16_le@90 = 88`, `u32_le@96 = 1`, `u32_le@100 = 191`
 - Nur kleine Spannungsdrift in `@8/@12/@16..22`
