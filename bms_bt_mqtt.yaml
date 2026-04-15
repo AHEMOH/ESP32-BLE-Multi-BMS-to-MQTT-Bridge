@@ -13,12 +13,18 @@ substitutions:
   battery_system_topology: "1-2"
 
   # Kommunikations-Timeouts/Intervals (alle in ms oder s)
-  ble_connect_timeout: "1000ms"
-  ble_read_timeout: "1200ms"
-  ble_sequential_delay: "700ms"
-  poll_interval: "15s"
-  publish_raw_frame_hex: "true"
+  # Weak-signal Profil fuer groessere Distanz zur Batterie.
+  ble_connect_timeout: "1800ms"
+  ble_read_timeout: "2200ms"
+  ble_retry_backoff_delay: "1200ms"
+  ble_disconnect_settle_delay: "1200ms"
+  ble_sequential_delay: "1200ms"
+  poll_interval: "30s"
+  publish_raw_frame_hex: "false"
   debug_status_flags_hex: "false"
+  watchdog_hang_timeout_s: "150"
+  watchdog_idle_recover_s: "150"
+  watchdog_reboot_after_recoveries: "3"
 
   # Batterien (PowerQueen/LiTime/Redodo Protokollfamilie)
   # name = Primärschlüssel für MQTT topics (z.B. "P-12100BNNA70-XXXXXX")
@@ -94,6 +100,34 @@ logger:
     api: WARN
     sntp: WARN
     component: WARN
+  on_message:
+    then:
+      - lambda: |-
+          if (!id(mqtt_client).is_connected()) {
+            return;
+          }
+
+          const std::string base = std::string("${mqtt_topic_prefix}") + "/" + std::string("${gateway_name}") + "/";
+          uint32_t ts = 0;
+          auto now = id(sntp_time).now();
+          if (now.is_valid()) {
+            ts = (uint32_t) now.timestamp;
+          } else {
+            ts = (uint32_t) (millis() / 1000UL);
+          }
+
+          std::string payload = esphome::to_string(ts);
+          payload += "|";
+          payload += tag;
+          payload += "|";
+          payload += message;
+
+          // 1=ERROR, 2=WARN (ESPHOME logger levels)
+          if (level == 1) {
+            id(mqtt_client).publish(base + "last_error", payload, 0, true);
+          } else if (level == 2) {
+            id(mqtt_client).publish(base + "last_warning", payload, 0, true);
+          }
 
 api:
   encryption:
@@ -134,6 +168,22 @@ globals:
     restore_value: no
     initial_value: '""'
   - id: discovery_last_publish_epoch
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: read_cycle_running
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: read_cycle_start_epoch
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: read_cycle_last_success_epoch
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: watchdog_recovery_count
     type: uint32_t
     restore_value: no
     initial_value: "0"
@@ -1541,6 +1591,10 @@ script:
           publish_value("discovery_prefix", "${ha_discovery_prefix}");
           publish_value("wifi_connected", wifi::global_wifi_component->is_connected() ? "true" : "false");
           publish_value("mqtt_connected", id(mqtt_client).is_connected() ? "true" : "false");
+          publish_value("read_cycle_running", id(read_cycle_running) ? "true" : "false");
+          publish_value("read_cycle_start_epoch", esphome::to_string(id(read_cycle_start_epoch)));
+          publish_value("read_cycle_last_success_epoch", esphome::to_string(id(read_cycle_last_success_epoch)));
+          publish_value("watchdog_recovery_count", esphome::to_string(id(watchdog_recovery_count)));
 
           std::string ip = id(gateway_ip_address).has_state() ? id(gateway_ip_address).state : std::string("");
           std::string ssid = id(gateway_wifi_ssid).has_state() ? id(gateway_wifi_ssid).state : std::string("");
@@ -1552,6 +1606,31 @@ script:
           if (id(gateway_uptime_s).has_state()) {
             publish_value("uptime_s", esphome::to_string((uint32_t) id(gateway_uptime_s).state));
           }
+
+  # ===== RECOVERY =====
+  - id: recover_from_stuck_cycle
+    mode: single
+    then:
+      - logger.log:
+          level: WARN
+          format: "Watchdog recovery: stopping scripts, disconnecting BLE clients, restarting scan"
+      - script.stop: read_bms1
+      - script.stop: read_bms2
+      - script.stop: read_bms3
+      - script.stop: read_bms4
+      - script.stop: read_bms5
+      - script.stop: read_bms6
+      - script.stop: read_and_publish_all
+      - ble_client.disconnect: bms1_ble_client
+      - ble_client.disconnect: bms2_ble_client
+      - ble_client.disconnect: bms3_ble_client
+      - ble_client.disconnect: bms4_ble_client
+      - ble_client.disconnect: bms5_ble_client
+      - ble_client.disconnect: bms6_ble_client
+      - esp32_ble_tracker.start_scan:
+      - lambda: |-
+          id(read_cycle_running) = false;
+          id(read_cycle_start_epoch) = 0;
 
   # ===== PUBLISH BMS 1 =====
   - id: publish_bms1
@@ -1582,7 +1661,7 @@ script:
           if (id(bms1_cell4_mv) < cell_min_mv) cell_min_mv = id(bms1_cell4_mv);
           uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
           const char *cell_delta_status = cell_delta_mv <= 10 ? "good" : (cell_delta_mv <= 20 ? "light" : (cell_delta_mv <= 40 ? "warning" : "critical"));
-          const std::string base_topic = "ble_battery/" + ble_name + "/";
+          const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
           auto publish_value = [&](const std::string &field, const std::string &value) {
             id(mqtt_client).publish(base_topic + field, value, 0, false);
           };
@@ -1610,6 +1689,13 @@ script:
           publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
           publish_value("cell_delta_status", cell_delta_status);
           publish_value("equil_state", esphome::to_string(id(bms1_equil_state)));
+          std::string bms1_equil_cell;
+          uint8_t bms1_eq = id(bms1_equil_state);
+          if (bms1_eq & 0x01) bms1_equil_cell += (bms1_equil_cell.empty() ? "" : ",") + std::string("cell1");
+          if (bms1_eq & 0x02) bms1_equil_cell += (bms1_equil_cell.empty() ? "" : ",") + std::string("cell2");
+          if (bms1_eq & 0x04) bms1_equil_cell += (bms1_equil_cell.empty() ? "" : ",") + std::string("cell3");
+          if (bms1_eq & 0x08) bms1_equil_cell += (bms1_equil_cell.empty() ? "" : ",") + std::string("cell4");
+          publish_value("equil_cell", bms1_equil_cell.empty() ? "none" : bms1_equil_cell);
           publish_value("protect_state", esphome::to_string(id(bms1_protect_state)));
           publish_value("discharge_switch", id(bms1_discharge_off) ? "OFF" : "ON");
           const char *bms1_operating_mode = id(bms1_operating_mode_raw) == 0 ? "idle" : (id(bms1_operating_mode_raw) == 1 ? "charge" : (id(bms1_operating_mode_raw) == 2 ? "discharge" : "unknown"));
@@ -1658,7 +1744,7 @@ script:
           if (id(bms2_cell4_mv) < cell_min_mv) cell_min_mv = id(bms2_cell4_mv);
           uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
           const char *cell_delta_status = cell_delta_mv <= 10 ? "good" : (cell_delta_mv <= 20 ? "light" : (cell_delta_mv <= 40 ? "warning" : "critical"));
-          const std::string base_topic = "ble_battery/" + ble_name + "/";
+          const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
           auto publish_value = [&](const std::string &field, const std::string &value) {
             id(mqtt_client).publish(base_topic + field, value, 0, false);
           };
@@ -1686,6 +1772,13 @@ script:
           publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
           publish_value("cell_delta_status", cell_delta_status);
           publish_value("equil_state", esphome::to_string(id(bms2_equil_state)));
+          std::string bms2_equil_cell;
+          uint8_t bms2_eq = id(bms2_equil_state);
+          if (bms2_eq & 0x01) bms2_equil_cell += (bms2_equil_cell.empty() ? "" : ",") + std::string("cell1");
+          if (bms2_eq & 0x02) bms2_equil_cell += (bms2_equil_cell.empty() ? "" : ",") + std::string("cell2");
+          if (bms2_eq & 0x04) bms2_equil_cell += (bms2_equil_cell.empty() ? "" : ",") + std::string("cell3");
+          if (bms2_eq & 0x08) bms2_equil_cell += (bms2_equil_cell.empty() ? "" : ",") + std::string("cell4");
+          publish_value("equil_cell", bms2_equil_cell.empty() ? "none" : bms2_equil_cell);
           publish_value("protect_state", esphome::to_string(id(bms2_protect_state)));
           publish_value("discharge_switch", id(bms2_discharge_off) ? "OFF" : "ON");
           const char *bms2_operating_mode = id(bms2_operating_mode_raw) == 0 ? "idle" : (id(bms2_operating_mode_raw) == 1 ? "charge" : (id(bms2_operating_mode_raw) == 2 ? "discharge" : "unknown"));
@@ -1734,7 +1827,7 @@ script:
           if (id(bms3_cell4_mv) < cell_min_mv) cell_min_mv = id(bms3_cell4_mv);
           uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
           const char *cell_delta_status = cell_delta_mv <= 10 ? "good" : (cell_delta_mv <= 20 ? "light" : (cell_delta_mv <= 40 ? "warning" : "critical"));
-          const std::string base_topic = "ble_battery/" + ble_name + "/";
+          const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
           auto publish_value = [&](const std::string &field, const std::string &value) {
             id(mqtt_client).publish(base_topic + field, value, 0, false);
           };
@@ -1762,6 +1855,13 @@ script:
           publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
           publish_value("cell_delta_status", cell_delta_status);
           publish_value("equil_state", esphome::to_string(id(bms3_equil_state)));
+          std::string bms3_equil_cell;
+          uint8_t bms3_eq = id(bms3_equil_state);
+          if (bms3_eq & 0x01) bms3_equil_cell += (bms3_equil_cell.empty() ? "" : ",") + std::string("cell1");
+          if (bms3_eq & 0x02) bms3_equil_cell += (bms3_equil_cell.empty() ? "" : ",") + std::string("cell2");
+          if (bms3_eq & 0x04) bms3_equil_cell += (bms3_equil_cell.empty() ? "" : ",") + std::string("cell3");
+          if (bms3_eq & 0x08) bms3_equil_cell += (bms3_equil_cell.empty() ? "" : ",") + std::string("cell4");
+          publish_value("equil_cell", bms3_equil_cell.empty() ? "none" : bms3_equil_cell);
           publish_value("protect_state", esphome::to_string(id(bms3_protect_state)));
           publish_value("discharge_switch", id(bms3_discharge_off) ? "OFF" : "ON");
           const char *bms3_operating_mode = id(bms3_operating_mode_raw) == 0 ? "idle" : (id(bms3_operating_mode_raw) == 1 ? "charge" : (id(bms3_operating_mode_raw) == 2 ? "discharge" : "unknown"));
@@ -1809,7 +1909,7 @@ script:
           if (id(bms4_cell4_mv) < cell_min_mv) cell_min_mv = id(bms4_cell4_mv);
           uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
           const char *cell_delta_status = cell_delta_mv <= 10 ? "good" : (cell_delta_mv <= 20 ? "light" : (cell_delta_mv <= 40 ? "warning" : "critical"));
-          const std::string base_topic = "ble_battery/" + ble_name + "/";
+          const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
           auto publish_value = [&](const std::string &field, const std::string &value) {
             id(mqtt_client).publish(base_topic + field, value, 0, false);
           };
@@ -1837,6 +1937,13 @@ script:
           publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
           publish_value("cell_delta_status", cell_delta_status);
           publish_value("equil_state", esphome::to_string(id(bms4_equil_state)));
+          std::string bms4_equil_cell;
+          uint8_t bms4_eq = id(bms4_equil_state);
+          if (bms4_eq & 0x01) bms4_equil_cell += (bms4_equil_cell.empty() ? "" : ",") + std::string("cell1");
+          if (bms4_eq & 0x02) bms4_equil_cell += (bms4_equil_cell.empty() ? "" : ",") + std::string("cell2");
+          if (bms4_eq & 0x04) bms4_equil_cell += (bms4_equil_cell.empty() ? "" : ",") + std::string("cell3");
+          if (bms4_eq & 0x08) bms4_equil_cell += (bms4_equil_cell.empty() ? "" : ",") + std::string("cell4");
+          publish_value("equil_cell", bms4_equil_cell.empty() ? "none" : bms4_equil_cell);
           publish_value("protect_state", esphome::to_string(id(bms4_protect_state)));
           publish_value("discharge_switch", id(bms4_discharge_off) ? "OFF" : "ON");
           const char *bms4_operating_mode = id(bms4_operating_mode_raw) == 0 ? "idle" : (id(bms4_operating_mode_raw) == 1 ? "charge" : (id(bms4_operating_mode_raw) == 2 ? "discharge" : "unknown"));
@@ -1884,7 +1991,7 @@ script:
           if (id(bms5_cell4_mv) < cell_min_mv) cell_min_mv = id(bms5_cell4_mv);
           uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
           const char *cell_delta_status = cell_delta_mv <= 10 ? "good" : (cell_delta_mv <= 20 ? "light" : (cell_delta_mv <= 40 ? "warning" : "critical"));
-          const std::string base_topic = "ble_battery/" + ble_name + "/";
+          const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
           auto publish_value = [&](const std::string &field, const std::string &value) {
             id(mqtt_client).publish(base_topic + field, value, 0, false);
           };
@@ -1912,6 +2019,13 @@ script:
           publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
           publish_value("cell_delta_status", cell_delta_status);
           publish_value("equil_state", esphome::to_string(id(bms5_equil_state)));
+          std::string bms5_equil_cell;
+          uint8_t bms5_eq = id(bms5_equil_state);
+          if (bms5_eq & 0x01) bms5_equil_cell += (bms5_equil_cell.empty() ? "" : ",") + std::string("cell1");
+          if (bms5_eq & 0x02) bms5_equil_cell += (bms5_equil_cell.empty() ? "" : ",") + std::string("cell2");
+          if (bms5_eq & 0x04) bms5_equil_cell += (bms5_equil_cell.empty() ? "" : ",") + std::string("cell3");
+          if (bms5_eq & 0x08) bms5_equil_cell += (bms5_equil_cell.empty() ? "" : ",") + std::string("cell4");
+          publish_value("equil_cell", bms5_equil_cell.empty() ? "none" : bms5_equil_cell);
           publish_value("protect_state", esphome::to_string(id(bms5_protect_state)));
           publish_value("discharge_switch", id(bms5_discharge_off) ? "OFF" : "ON");
           const char *bms5_operating_mode = id(bms5_operating_mode_raw) == 0 ? "idle" : (id(bms5_operating_mode_raw) == 1 ? "charge" : (id(bms5_operating_mode_raw) == 2 ? "discharge" : "unknown"));
@@ -1959,7 +2073,7 @@ script:
           if (id(bms6_cell4_mv) < cell_min_mv) cell_min_mv = id(bms6_cell4_mv);
           uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
           const char *cell_delta_status = cell_delta_mv <= 10 ? "good" : (cell_delta_mv <= 20 ? "light" : (cell_delta_mv <= 40 ? "warning" : "critical"));
-          const std::string base_topic = "ble_battery/" + ble_name + "/";
+          const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
           auto publish_value = [&](const std::string &field, const std::string &value) {
             id(mqtt_client).publish(base_topic + field, value, 0, false);
           };
@@ -1987,6 +2101,13 @@ script:
           publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
           publish_value("cell_delta_status", cell_delta_status);
           publish_value("equil_state", esphome::to_string(id(bms6_equil_state)));
+          std::string bms6_equil_cell;
+          uint8_t bms6_eq = id(bms6_equil_state);
+          if (bms6_eq & 0x01) bms6_equil_cell += (bms6_equil_cell.empty() ? "" : ",") + std::string("cell1");
+          if (bms6_eq & 0x02) bms6_equil_cell += (bms6_equil_cell.empty() ? "" : ",") + std::string("cell2");
+          if (bms6_eq & 0x04) bms6_equil_cell += (bms6_equil_cell.empty() ? "" : ",") + std::string("cell3");
+          if (bms6_eq & 0x08) bms6_equil_cell += (bms6_equil_cell.empty() ? "" : ",") + std::string("cell4");
+          publish_value("equil_cell", bms6_equil_cell.empty() ? "none" : bms6_equil_cell);
           publish_value("protect_state", esphome::to_string(id(bms6_protect_state)));
           publish_value("discharge_switch", id(bms6_discharge_off) ? "OFF" : "ON");
           const char *bms6_operating_mode = id(bms6_operating_mode_raw) == 0 ? "idle" : (id(bms6_operating_mode_raw) == 1 ? "charge" : (id(bms6_operating_mode_raw) == 2 ? "discharge" : "unknown"));
@@ -2416,7 +2537,7 @@ script:
             );
           }
 
-          const std::string base_topic = "ble_battery/" + system_name + "/";
+          const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + system_name + "/";
           auto publish_value = [&](const std::string &field, const std::string &value) {
             id(mqtt_client).publish(base_topic + field, value, 0, false);
           };
@@ -2474,7 +2595,7 @@ script:
   - id: publish_ha_discovery
     then:
       - lambda: |-
-          const std::string prefix = "ble_battery";
+          const std::string prefix = "${mqtt_topic_prefix}";
           const std::string discovery_prefix = "${ha_discovery_prefix}";
           const std::string system_name = "${battery_system_name}";
           const std::string node_id = "${gateway_name}";
@@ -2622,6 +2743,7 @@ script:
             publish_sensor(slot_tag + "_cell_delta_mv", "Cell Voltage Delta", state_base + "cell_delta_mv", dev_id, dev_name, dev_model, "mV", "", "measurement", "mdi:battery-sync");
             publish_sensor(slot_tag + "_cell_delta_status", "Cell Delta Status", state_base + "cell_delta_status", dev_id, dev_name, dev_model, "", "", "", "mdi:scale-balance");
             publish_sensor(slot_tag + "_equil_state", "Equalization State", state_base + "equil_state", dev_id, dev_name, dev_model, "", "", "", "mdi:scale-balance");
+            publish_sensor(slot_tag + "_equil_cell", "Equalization Cell", state_base + "equil_cell", dev_id, dev_name, dev_model, "", "", "", "mdi:battery-sync");
             publish_sensor(slot_tag + "_protect_state", "Protection State", state_base + "protect_state", dev_id, dev_name, dev_model, "", "", "", "mdi:shield-alert-outline");
             publish_binary_sensor(slot_tag + "_discharge_switch", "Discharge Switch", state_base + "discharge_switch", dev_id, dev_name, dev_model, "ON", "OFF", "", "mdi:toggle-switch-outline");
             publish_sensor(slot_tag + "_operating_mode_raw", "Operating Mode Raw", state_base + "operating_mode_raw", dev_id, dev_name, dev_model, "", "", "", "mdi:code-tags");
@@ -2687,7 +2809,6 @@ script:
                   id(bms1_ble_client).set_address(addr);
                 }
             - globals.set: { id: bms1_frame_received, value: "false" }
-            - esp32_ble_tracker.stop_scan:
             - ble_client.connect: bms1_ble_client
             - delay: ${ble_connect_timeout}
             - ble_client.ble_write:
@@ -2701,9 +2822,29 @@ script:
                 then:
                   - script.execute: publish_bms1
                 else:
-                  - globals.set: { id: bms1_connected, value: "false" }
+                  - logger.log:
+                      level: WARN
+                      format: "BMS1: first read attempt failed, retrying BLE session"
+                  - ble_client.disconnect: bms1_ble_client
+                  - delay: ${ble_disconnect_settle_delay}
+                  - delay: ${ble_retry_backoff_delay}
+                  - globals.set: { id: bms1_frame_received, value: "false" }
+                  - ble_client.connect: bms1_ble_client
+                  - delay: ${ble_connect_timeout}
+                  - ble_client.ble_write:
+                      id: bms1_ble_client
+                      service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb"
+                      characteristic_uuid: "0000ffe2-0000-1000-8000-00805f9b34fb"
+                      value: [0x00, 0x00, 0x04, 0x01, 0x13, 0x55, 0xAA, 0x17]
+                  - delay: ${ble_read_timeout}
+                  - if:
+                      condition: { lambda: return id(bms1_frame_received); }
+                      then:
+                        - script.execute: publish_bms1
+                      else:
+                        - globals.set: { id: bms1_connected, value: "false" }
             - ble_client.disconnect: bms1_ble_client
-            - esp32_ble_tracker.start_scan:
+            - delay: ${ble_disconnect_settle_delay}
             - delay: ${ble_sequential_delay}
 
   - id: read_bms2
@@ -2721,7 +2862,6 @@ script:
                   id(bms2_ble_client).set_address(addr);
                 }
             - globals.set: { id: bms2_frame_received, value: "false" }
-            - esp32_ble_tracker.stop_scan:
             - ble_client.connect: bms2_ble_client
             - delay: ${ble_connect_timeout}
             - ble_client.ble_write:
@@ -2735,9 +2875,29 @@ script:
                 then:
                   - script.execute: publish_bms2
                 else:
-                  - globals.set: { id: bms2_connected, value: "false" }
+                  - logger.log:
+                      level: WARN
+                      format: "BMS2: first read attempt failed, retrying BLE session"
+                  - ble_client.disconnect: bms2_ble_client
+                  - delay: ${ble_disconnect_settle_delay}
+                  - delay: ${ble_retry_backoff_delay}
+                  - globals.set: { id: bms2_frame_received, value: "false" }
+                  - ble_client.connect: bms2_ble_client
+                  - delay: ${ble_connect_timeout}
+                  - ble_client.ble_write:
+                      id: bms2_ble_client
+                      service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb"
+                      characteristic_uuid: "0000ffe2-0000-1000-8000-00805f9b34fb"
+                      value: [0x00, 0x00, 0x04, 0x01, 0x13, 0x55, 0xAA, 0x17]
+                  - delay: ${ble_read_timeout}
+                  - if:
+                      condition: { lambda: return id(bms2_frame_received); }
+                      then:
+                        - script.execute: publish_bms2
+                      else:
+                        - globals.set: { id: bms2_connected, value: "false" }
             - ble_client.disconnect: bms2_ble_client
-            - esp32_ble_tracker.start_scan:
+            - delay: ${ble_disconnect_settle_delay}
             - delay: ${ble_sequential_delay}
 
   - id: read_bms3
@@ -2755,7 +2915,6 @@ script:
                   id(bms3_ble_client).set_address(addr);
                 }
             - globals.set: { id: bms3_frame_received, value: "false" }
-            - esp32_ble_tracker.stop_scan:
             - ble_client.connect: bms3_ble_client
             - delay: ${ble_connect_timeout}
             - ble_client.ble_write: { id: bms3_ble_client, service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb", characteristic_uuid: "0000ffe2-0000-1000-8000-00805f9b34fb", value: [0x00, 0x00, 0x04, 0x01, 0x13, 0x55, 0xAA, 0x17] }
@@ -2767,7 +2926,6 @@ script:
                 else:
                   - globals.set: { id: bms3_connected, value: "false" }
             - ble_client.disconnect: bms3_ble_client
-            - esp32_ble_tracker.start_scan:
             - delay: ${ble_sequential_delay}
 
   - id: read_bms4
@@ -2785,7 +2943,6 @@ script:
                   id(bms4_ble_client).set_address(addr);
                 }
             - globals.set: { id: bms4_frame_received, value: "false" }
-            - esp32_ble_tracker.stop_scan:
             - ble_client.connect: bms4_ble_client
             - delay: ${ble_connect_timeout}
             - ble_client.ble_write: { id: bms4_ble_client, service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb", characteristic_uuid: "0000ffe2-0000-1000-8000-00805f9b34fb", value: [0x00, 0x00, 0x04, 0x01, 0x13, 0x55, 0xAA, 0x17] }
@@ -2797,7 +2954,6 @@ script:
                 else:
                   - globals.set: { id: bms4_connected, value: "false" }
             - ble_client.disconnect: bms4_ble_client
-            - esp32_ble_tracker.start_scan:
             - delay: ${ble_sequential_delay}
 
   - id: read_bms5
@@ -2815,7 +2971,6 @@ script:
                   id(bms5_ble_client).set_address(addr);
                 }
             - globals.set: { id: bms5_frame_received, value: "false" }
-            - esp32_ble_tracker.stop_scan:
             - ble_client.connect: bms5_ble_client
             - delay: ${ble_connect_timeout}
             - ble_client.ble_write: { id: bms5_ble_client, service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb", characteristic_uuid: "0000ffe2-0000-1000-8000-00805f9b34fb", value: [0x00, 0x00, 0x04, 0x01, 0x13, 0x55, 0xAA, 0x17] }
@@ -2827,7 +2982,6 @@ script:
                 else:
                   - globals.set: { id: bms5_connected, value: "false" }
             - ble_client.disconnect: bms5_ble_client
-            - esp32_ble_tracker.start_scan:
             - delay: ${ble_sequential_delay}
 
   - id: read_bms6
@@ -2845,7 +2999,6 @@ script:
                   id(bms6_ble_client).set_address(addr);
                 }
             - globals.set: { id: bms6_frame_received, value: "false" }
-            - esp32_ble_tracker.stop_scan:
             - ble_client.connect: bms6_ble_client
             - delay: ${ble_connect_timeout}
             - ble_client.ble_write: { id: bms6_ble_client, service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb", characteristic_uuid: "0000ffe2-0000-1000-8000-00805f9b34fb", value: [0x00, 0x00, 0x04, 0x01, 0x13, 0x55, 0xAA, 0x17] }
@@ -2857,20 +3010,29 @@ script:
                 else:
                   - globals.set: { id: bms6_connected, value: "false" }
             - ble_client.disconnect: bms6_ble_client
-            - esp32_ble_tracker.start_scan:
             - delay: ${ble_sequential_delay}
 
   # ===== MAIN CYCLE =====
   - id: read_and_publish_all
     mode: single
     then:
+      - lambda: |-
+          uint32_t now_ts = 0;
+          auto now = id(sntp_time).now();
+          if (now.is_valid()) {
+            now_ts = (uint32_t) now.timestamp;
+          } else {
+            now_ts = (uint32_t) (millis() / 1000UL);
+          }
+          id(read_cycle_running) = true;
+          id(read_cycle_start_epoch) = now_ts;
       - if:
           condition:
             and:
               - wifi.connected:
               - mqtt.connected:
           then:
-            - esp32_ble_tracker.start_scan:
+            - esp32_ble_tracker.stop_scan:
             - logger.log: "Starting multi-battery read cycle"
             - script.execute: read_bms1
             - script.wait: read_bms1
@@ -2887,6 +3049,16 @@ script:
             - script.execute: publish_system_aggregate
             - esp32_ble_tracker.start_scan:
             - logger.log: "Multi-battery read cycle complete"
+            - lambda: |-
+                uint32_t now_ts = 0;
+                auto now = id(sntp_time).now();
+                if (now.is_valid()) {
+                  now_ts = (uint32_t) now.timestamp;
+                } else {
+                  now_ts = (uint32_t) (millis() / 1000UL);
+                }
+                id(read_cycle_last_success_epoch) = now_ts;
+                id(watchdog_recovery_count) = 0;
           else:
             - logger.log:
                 level: WARN
@@ -2894,6 +3066,8 @@ script:
                 args:
                   - 'wifi::global_wifi_component->is_connected() ? "connected" : "not_connected"'
                   - 'id(mqtt_client).is_connected() ? "connected" : "not_connected"'
+      - lambda: |-
+          id(read_cycle_running) = false;
 
 interval:
   - interval: ${poll_interval}
@@ -2907,6 +3081,44 @@ interval:
             - logger.log:
                 level: WARN
                 format: "Skipping cycle trigger (read_and_publish_all still running)"
+
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            and:
+              - wifi.connected:
+              - mqtt.connected:
+          then:
+            - lambda: |-
+                uint32_t now_ts = 0;
+                auto now = id(sntp_time).now();
+                if (now.is_valid()) {
+                  now_ts = (uint32_t) now.timestamp;
+                } else {
+                  now_ts = (uint32_t) (millis() / 1000UL);
+                }
+
+                const uint32_t hang_timeout_s = (uint32_t) atoi("${watchdog_hang_timeout_s}");
+                const uint32_t idle_recover_s = (uint32_t) atoi("${watchdog_idle_recover_s}");
+                const uint32_t reboot_after = (uint32_t) atoi("${watchdog_reboot_after_recoveries}");
+
+                if (id(read_cycle_running) && id(read_cycle_start_epoch) > 0 && (now_ts - id(read_cycle_start_epoch)) > hang_timeout_s) {
+                  id(watchdog_recovery_count) += 1U;
+                  if (id(watchdog_recovery_count) < reboot_after) {
+                    ESP_LOGE("WATCHDOG", "Read cycle hang detected (>%us). Soft recovery #%u", (unsigned int) hang_timeout_s, (unsigned int) id(watchdog_recovery_count));
+                    id(recover_from_stuck_cycle).execute();
+                  } else {
+                    ESP_LOGE("WATCHDOG", "Read cycle hang persists (>%us). Reboot #%u", (unsigned int) hang_timeout_s, (unsigned int) id(watchdog_recovery_count));
+                    ESP.restart();
+                  }
+                  return;
+                }
+
+                if (!id(read_cycle_running) && id(read_cycle_last_success_epoch) > 0 && (now_ts - id(read_cycle_last_success_epoch)) > idle_recover_s) {
+                  ESP_LOGW("WATCHDOG", "No successful cycle for >%us. Triggering recovery cycle.", (unsigned int) idle_recover_s);
+                  id(read_and_publish_all).execute();
+                }
 
   - interval: 60s
     then:

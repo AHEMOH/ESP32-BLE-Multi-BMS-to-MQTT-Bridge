@@ -54,6 +54,7 @@ Es basiert auf realen LiTime- und PowerQueen-Frames, App-Vergleichswerten und la
 - `cell_delta_mv`
 - `cell_delta_status`
 - `equil_state`
+- `equil_cell` (heuristisch aus `equil_state`-Bitmaske: `1->cell1`, `2->cell2`, `4->cell3`, `8->cell4`; bei mehreren Bits als CSV, z. B. `cell1,cell3`)
 - `protect_state`
 - `discharge_switch` (`ON`/`OFF`)
 - `operating_mode_raw`
@@ -115,8 +116,10 @@ Aktuelle Schwellwerte:
 ## 6) Beobachtete `equil_state`-Hinweise (Hypothese)
 
 Fuer Batterie `L-12100BNNA70-XXXXXX`:
-- `equil_state = 2` -> Vermutung: Cell 1 wird aktiv gebalanced
+- `equil_state = 1` -> Vermutung: Cell 1 wird aktiv gebalanced
+- `equil_state = 2` -> Vermutung: Cell 2 wird aktiv gebalanced
 - `equil_state = 4` -> Vermutung: Cell 3 wird aktiv gebalanced
+- `equil_state = 8` -> Vermutung: Cell 4 wird aktiv gebalanced
 
 Status: noch nicht final bestaetigt, aber reproduzierbar beobachtet.
 
@@ -378,9 +381,60 @@ Fazit zu den zwei Frames:
 - Sie liefern keine direkte Antwort auf die Payloads von `0x10/0x16/0x41/0x43`,
   da beide Frames bereits `0x65`-Statusantworten sind.
 - Fuer die vier Zusatzkommandos braucht es gezielte Request/Response-Captures je CMD.
-  - `u16_le@62 = 8867`, `u16_le@64 = 10058`
-  - `u16_le@90 = 88`, `u32_le@96 = 1`, `u32_le@100 = 191`
-- Nur kleine Spannungsdrift in `@8/@12/@16..22`
+
+## 11) Balancer-Verhalten in der Praxis (Zeitversatz beachten)
+
+Praxisbefund (Live-Grafik):
+
+- Wenn eine Zelle als zu hoch erkannt wird, wird sie aktiv heruntergezogen (Bleeding),
+  teils sogar kurzfristig unter die anderen Zellen.
+
+Folge fuer Frame-Interpretation:
+
+- Ein einzelner Spaet-Frame kann deshalb ein anderes "hoechste Zelle"-Bild zeigen
+  als die Ausloesesituation des Balancer-Flags.
+- Das erklaert beobachtete Faelle wie `equil_state = 8`, obwohl im betrachteten
+  Einzel-Frame nicht mehr Cell 4 die hoechste ist.
+
+Aktueller Schluss:
+
+- Die Bitmasken-Hypothese fuer `equil_state@84` bleibt plausibel.
+- Zur belastbaren Verifikation sind zeitlich zusammenhaengende Frame-Sequenzen
+  (nicht nur Einzel-Frames) entscheidend.
+
+### 11.1 LI-Folgeframe: Zellvergleich mit deutlichem Drop auf Cell 4
+
+Verglichene Frames (gleiche Batterie, kurzer zeitlicher Abstand):
+
+- Alt: `000065019355AA005B3700004A360000AF0D7C0D830D9C0D...0000005E`
+- Neu: `000065019355AA00433700003F360000AE0D7B0D820D940D...00000030`
+
+Beide Frames:
+
+- Laenge `105` Byte
+- Checksumme korrekt
+- `equil_state@84 = 8`
+
+Zellspannungs-Deltas (neu minus alt):
+
+- `cell1`: `3503 -> 3502` mV (`-1` mV)
+- `cell2`: `3452 -> 3451` mV (`-1` mV)
+- `cell3`: `3459 -> 3458` mV (`-1` mV)
+- `cell4`: `3484 -> 3476` mV (`-8` mV)
+
+Interpretation:
+
+- In dieser Sequenz faellt Cell 4 deutlich staerker als die anderen Zellen.
+- Das stuetzt die Zuordnung `equil_state = 8` zu einer aktiven Balancing-Aktivitaet auf Cell 4.
+
+Praktische Empfehlung fuer Anzeige `equil_cell`:
+
+- Wir koennen die Anzeige jetzt sinnvoll erweitern auf eine vorlaeufige Bitmaske:
+  - `1 -> cell1`
+  - `2 -> cell2`
+  - `4 -> cell3`
+  - `8 -> cell4`
+- Kennzeichnung in UI weiterhin als "vorlaeufig/heuristisch", bis die Zuordnung ueber mehr Zeitreihen final bestaetigt ist.
 
 Schlussfolgerung:
 - Beide Varianten zeigen nun mehrfach reproduzierbare Zustandsmuster fuer OFF/ON und Last/no-load.

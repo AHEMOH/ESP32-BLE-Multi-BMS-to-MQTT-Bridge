@@ -17,6 +17,7 @@ The configuration reads up to 6 batteries sequentially via BLE, publishes per-ba
 
 - Telemetry topics are published as non-retained (`retain=false`).
 - Discovery config topics are published as retained (`retain=true`).
+- Raw frame publishing is disabled by default for lower runtime load (`publish_raw_frame_hex: "false"`).
 - Discharge state is published as a single field:
 	- `discharge_switch` with values `ON` or `OFF`
 
@@ -45,7 +46,7 @@ The configuration reads up to 6 batteries sequentially via BLE, publishes per-ba
 
 ## MQTT Topic Model
 
-Base prefix is `ble_battery`.
+Base prefix is configurable via `mqtt_topic_prefix` (default: `ble_battery`).
 
 Per battery:
 - `ble_battery/<battery_name>/voltage_mv`
@@ -54,6 +55,7 @@ Per battery:
 - `ble_battery/<battery_name>/discharge_switch`
 - `ble_battery/<battery_name>/operating_mode`
 - `ble_battery/<battery_name>/equil_state`
+- `ble_battery/<battery_name>/equil_cell` (`none`, `cell1`, ..., or CSV like `cell1,cell3` for multi-bit states)
 
 Pack/system aggregate:
 - `ble_battery/<battery_system_name>/pack_voltage_mv`
@@ -62,6 +64,16 @@ Pack/system aggregate:
 - `ble_battery/<battery_system_name>/series_group_voltage_delta_mv`
 - `ble_battery/<battery_system_name>/topology_reporting`
 - `ble_battery/<battery_system_name>/topology_complete`
+
+Gateway health:
+- `ble_battery/<gateway_name>/read_cycle_running`
+- `ble_battery/<gateway_name>/read_cycle_start_epoch`
+- `ble_battery/<gateway_name>/read_cycle_last_success_epoch`
+- `ble_battery/<gateway_name>/watchdog_recovery_count`
+
+Stability behavior:
+- If a read cycle is stuck for more than 180s, watchdog triggers a controlled reboot.
+- If no successful cycle was published for more than 90s (while idle), watchdog triggers a recovery cycle.
 
 ## Topology Syntax
 
