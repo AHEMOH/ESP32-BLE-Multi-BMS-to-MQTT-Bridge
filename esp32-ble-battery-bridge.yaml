@@ -1,0 +1,3220 @@
+# ═══════════════════════════════════════════════════════════════════════
+# SUBSTITUTIONS
+# ═══════════════════════════════════════════════════════════════════════
+substitutions:
+  # ── Gateway & MQTT ────────────────────────────────────────────────────
+  gateway_name: esp32-battery-bridge
+  gateway_friendly_name: "ESP32 BLE Battery Bridge"
+  mqtt_topic_prefix: ble_battery
+  ha_discovery_prefix: homeassistant
+
+  # ── Battery system for aggregation ────────────────────────────────────
+  # '-' separates series groups; digits within a group are parallel.
+  # Examples: "123-456" = 2S3P, "12-34-56" = 3S2P
+  battery_system_name: "Bootsbatterie"
+  battery_system_topology: "1-2"
+
+  # ── Timing & retries (weak-signal profile for longer BLE range) ───────
+  ble_connect_timeout: "1800ms"
+  ble_read_timeout: "2200ms"
+  ble_retry_backoff_delay: "1200ms"
+  ble_disconnect_settle_delay: "1200ms"
+  ble_sequential_delay: "1200ms"
+  poll_interval: "30s"
+  publish_raw_frame_hex: "false"
+  debug_status_flags_hex: "false"
+  watchdog_hang_timeout_s: "150"
+  watchdog_idle_recover_s: "150"
+  watchdog_reboot_after_recoveries: "3"
+
+  # ── Battery slots (bms1–bms6) ─────────────────────────────────────────
+  # name   = MQTT topic key (e.g. "P-12100BNNA70-A02571"); empty = slot inactive
+  # mac    = BLE address; empty = auto-bind by name (stored in NVS flash)
+  # enabled = "true" / "false"  — slot is active when enabled=true AND name is not empty
+
+  bms1_name: "P-12100BNNA70-XXXXXX"
+  bms1_mac: "XX:XX:XX:XX:XX:XX"
+  bms1_enabled: "true"
+
+  bms2_name: "L-12100BNNA70-XXXXXX"
+  bms2_mac: "XX:XX:XX:XX:XX:XX"
+  bms2_enabled: "true"
+
+  bms3_name: ""
+  bms3_mac: ""
+  bms3_enabled: "false"
+
+  bms4_name: ""
+  bms4_mac: ""
+  bms4_enabled: "false"
+
+  bms5_name: ""
+  bms5_mac: ""
+  bms5_enabled: "false"
+
+  bms6_name: ""
+  bms6_mac: ""
+  bms6_enabled: "false"
+
+esphome:
+  name: ${gateway_name}
+  friendly_name: ${gateway_friendly_name}
+  on_boot:
+    priority: -10
+    then:
+      - logger.log:
+          format: "BLE Battery Bridge started (system=%s, topology=%s)"
+          args: ['"${battery_system_name}"', '"${battery_system_topology}"']
+          level: INFO
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+esp32_ble:
+  max_connections: 6
+
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+    - ssid: !secret wifi_ssid_2
+      password: !secret wifi_password_2
+    - ssid: !secret wifi_ssid_3
+      password: !secret wifi_password_3
+
+logger:
+  level: WARN
+  logs:
+    mqtt: WARN
+    wifi: WARN
+    ble_client: WARN
+    # BLE disconnects are intentional (sequential polling) — suppress to avoid log spam.
+    ble_sensor: ERROR
+    esp32_ble_client: WARN
+    esp32_ble_tracker: WARN
+    esp-idf: ERROR
+    api: WARN
+    sntp: WARN
+    component: WARN
+  on_message:
+    then:
+      - lambda: |-
+          if (!id(mqtt_client).is_connected()) {
+            return;
+          }
+
+          const std::string base = std::string("${mqtt_topic_prefix}") + "/" + std::string("${gateway_name}") + "/";
+          uint32_t ts = 0;
+          auto now = id(sntp_time).now();
+          if (now.is_valid()) {
+            ts = (uint32_t) now.timestamp;
+          } else {
+            ts = (uint32_t) (millis() / 1000UL);
+          }
+
+          std::string payload = esphome::to_string(ts);
+          payload += "|";
+          payload += tag;
+          payload += "|";
+          payload += message;
+
+          // 1=ERROR, 2=WARN (ESPHOME logger levels)
+          if (level == 1) {
+            id(mqtt_client).publish(base + "last_error", payload, 0, true);
+          } else if (level == 2) {
+            id(mqtt_client).publish(base + "last_warning", payload, 0, true);
+          }
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+mqtt:
+  broker: !secret mqtt_broker_host
+  port: 1883
+  log_topic: null
+  discovery: true
+  discovery_prefix: ${ha_discovery_prefix}
+  id: mqtt_client
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  on_connect:
+    then:
+      - script.execute: publish_ha_discovery
+      - script.execute: publish_gateway_status
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Berlin
+    servers:
+      - pool.ntp.org
+      - time.nist.gov
+
+# ═══════════════════════════════════════════════════════════════════════
+# GLOBALS — per-slot state variables (restored from NVS where noted)
+# ═══════════════════════════════════════════════════════════════════════
+globals:
+  - id: discovery_last_mac
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: discovery_last_publish_epoch
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: read_cycle_running
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: read_cycle_start_epoch
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: read_cycle_last_success_epoch
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: watchdog_recovery_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  # ===== BMS 1 =====
+  - id: bms1_frame_received
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms1_connected
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms1_last_read_epoch
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_bound_mac
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 17
+    initial_value: '""'
+  - id: bms1_rssi
+    type: int16_t
+    restore_value: no
+    initial_value: "-127"
+  - id: bms1_pack_voltage_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_voltage_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_current_ma
+    type: int16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_remain_ah
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_factory_ah
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_cell_temp
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_mosfet_temp
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_soc
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_soh
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_cell1_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_cell2_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_cell3_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_cell4_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_equil_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_protect_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_discharge_switch_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_status_flags
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_discharge_off
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms1_operating_mode_raw
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_cycle_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_discharge_ah_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms1_last_frame_hex
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+  # ===== BMS 2 =====
+  - id: bms2_frame_received
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms2_connected
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms2_last_read_epoch
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_bound_mac
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 17
+    initial_value: '""'
+  - id: bms2_rssi
+    type: int16_t
+    restore_value: no
+    initial_value: "-127"
+  - id: bms2_pack_voltage_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_voltage_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_current_ma
+    type: int16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_remain_ah
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_factory_ah
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_cell_temp
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_mosfet_temp
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_soc
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_soh
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_cell1_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_cell2_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_cell3_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_cell4_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_equil_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_protect_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_discharge_switch_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_status_flags
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_discharge_off
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms2_operating_mode_raw
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_cycle_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_discharge_ah_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms2_last_frame_hex
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+  # ===== BMS 3 =====
+  - id: bms3_frame_received
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms3_connected
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms3_last_read_epoch
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_bound_mac
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 17
+    initial_value: '""'
+  - id: bms3_rssi
+    type: int16_t
+    restore_value: no
+    initial_value: "-127"
+  - id: bms3_pack_voltage_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_voltage_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_current_ma
+    type: int16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_remain_ah
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_factory_ah
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_cell_temp
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_mosfet_temp
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_soc
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_soh
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_cell1_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_cell2_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_cell3_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_cell4_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_equil_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_protect_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_discharge_switch_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_status_flags
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_discharge_off
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms3_operating_mode_raw
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_cycle_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_discharge_ah_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms3_last_frame_hex
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+  # ===== BMS 4 =====
+  - id: bms4_frame_received
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms4_connected
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms4_last_read_epoch
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_bound_mac
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 17
+    initial_value: '""'
+  - id: bms4_rssi
+    type: int16_t
+    restore_value: no
+    initial_value: "-127"
+  - id: bms4_pack_voltage_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_voltage_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_current_ma
+    type: int16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_remain_ah
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_factory_ah
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_cell_temp
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_mosfet_temp
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_soc
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_soh
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_cell1_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_cell2_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_cell3_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_cell4_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_equil_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_protect_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_discharge_switch_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_status_flags
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_discharge_off
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms4_operating_mode_raw
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_cycle_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_discharge_ah_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms4_last_frame_hex
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+  # ===== BMS 5 =====
+  - id: bms5_frame_received
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms5_connected
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms5_last_read_epoch
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_bound_mac
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 17
+    initial_value: '""'
+  - id: bms5_rssi
+    type: int16_t
+    restore_value: no
+    initial_value: "-127"
+  - id: bms5_pack_voltage_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_voltage_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_current_ma
+    type: int16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_remain_ah
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_factory_ah
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_cell_temp
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_mosfet_temp
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_soc
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_soh
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_cell1_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_cell2_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_cell3_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_cell4_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_equil_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_protect_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_discharge_switch_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_status_flags
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_discharge_off
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms5_operating_mode_raw
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_cycle_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_discharge_ah_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms5_last_frame_hex
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+  # ===== BMS 6 =====
+  - id: bms6_frame_received
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms6_connected
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms6_last_read_epoch
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_bound_mac
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 17
+    initial_value: '""'
+  - id: bms6_rssi
+    type: int16_t
+    restore_value: no
+    initial_value: "-127"
+  - id: bms6_pack_voltage_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_voltage_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_current_ma
+    type: int16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_remain_ah
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_factory_ah
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_cell_temp
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_mosfet_temp
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_soc
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_soh
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_cell1_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_cell2_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_cell3_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_cell4_mv
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_equil_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_protect_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_discharge_switch_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_status_flags
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_discharge_off
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: bms6_operating_mode_raw
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_cycle_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_discharge_ah_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: bms6_last_frame_hex
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+# ═══════════════════════════════════════════════════════════════════════
+# BLE TRACKER — auto-binding: advertised name → MAC → NVS flash
+# ═══════════════════════════════════════════════════════════════════════
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 1.1s
+    window: 1.1s
+    active: true
+  on_ble_advertise:
+    then:
+      - lambda: |-
+          const std::string adv_mac = x.address_str();
+          const std::string adv_name = x.get_name();
+
+          if (adv_name.empty()) {
+            return;
+          }
+
+          bool likely_bms = false;
+          if (adv_name.rfind("P-", 0) == 0) likely_bms = true;
+          if (adv_name.rfind("L-", 0) == 0) likely_bms = true;
+          if (adv_name.rfind("R-", 0) == 0) likely_bms = true;
+          if (!likely_bms) {
+            return;
+          }
+
+          if (id(discovery_last_mac) == adv_mac) {
+            return;
+          }
+          id(discovery_last_mac) = adv_mac;
+
+          auto bind_slot = [&](int slot, const std::string &slot_name, const std::string &slot_mac, const std::string &slot_enabled, std::string &bound_mac, int16_t &slot_rssi) {
+            if (slot_enabled != "true" || slot_name.empty()) {
+              return;
+            }
+
+            const bool name_match = (adv_name == slot_name);
+            const bool static_mode = !slot_mac.empty();
+            const std::string expected_mac = static_mode ? slot_mac : bound_mac;
+            const bool mac_match = !expected_mac.empty() && (adv_mac == expected_mac);
+
+            if (name_match) {
+              slot_rssi = x.get_rssi();
+              if (!static_mode && bound_mac != adv_mac) {
+                bound_mac = adv_mac;
+              }
+
+              if (static_mode && slot_mac != adv_mac) {
+                ESP_LOGW("BIND", "Slot %d (%s): name match but MAC mismatch (expected=%s seen=%s)", slot, slot_name.c_str(), slot_mac.c_str(), adv_mac.c_str());
+              }
+              return;
+            }
+
+            if (mac_match) {
+              slot_rssi = x.get_rssi();
+              ESP_LOGW("BIND", "Slot %d (%s): MAC match but name mismatch (seen=%s)", slot, slot_name.c_str(), adv_name.c_str());
+
+              if (!static_mode) {
+                bound_mac.clear();
+              }
+            }
+          };
+
+          bind_slot(1, "${bms1_name}", "${bms1_mac}", "${bms1_enabled}", id(bms1_bound_mac), id(bms1_rssi));
+          bind_slot(2, "${bms2_name}", "${bms2_mac}", "${bms2_enabled}", id(bms2_bound_mac), id(bms2_rssi));
+          bind_slot(3, "${bms3_name}", "${bms3_mac}", "${bms3_enabled}", id(bms3_bound_mac), id(bms3_rssi));
+          bind_slot(4, "${bms4_name}", "${bms4_mac}", "${bms4_enabled}", id(bms4_bound_mac), id(bms4_rssi));
+          bind_slot(5, "${bms5_name}", "${bms5_mac}", "${bms5_enabled}", id(bms5_bound_mac), id(bms5_rssi));
+          bind_slot(6, "${bms6_name}", "${bms6_mac}", "${bms6_enabled}", id(bms6_bound_mac), id(bms6_rssi));
+
+# ═══════════════════════════════════════════════════════════════════════
+# BLE CLIENTS — one per slot (auto_connect: false — driven by scripts)
+# ═══════════════════════════════════════════════════════════════════════
+ble_client:
+  - mac_address: "${bms1_mac}"
+    id: bms1_ble_client
+    auto_connect: false
+
+  - mac_address: "${bms2_mac}"
+    id: bms2_ble_client
+    auto_connect: false
+
+  - # Placeholder MACs for slots 3–6; actual address is set via set_address() before connect,
+    # which allows empty bmsX_mac substitutions.
+    mac_address: "00:00:00:00:00:03"
+    id: bms3_ble_client
+    auto_connect: false
+
+  - mac_address: "00:00:00:00:00:04"
+    id: bms4_ble_client
+    auto_connect: false
+
+  - mac_address: "00:00:00:00:00:05"
+    id: bms5_ble_client
+    auto_connect: false
+
+  - mac_address: "00:00:00:00:00:06"
+    id: bms6_ble_client
+    auto_connect: false
+
+# ═══════════════════════════════════════════════════════════════════════
+# SENSORS — BLE frame parsers (105-byte frame, little-endian, checksum @ byte 104)
+# ═══════════════════════════════════════════════════════════════════════
+sensor:
+  - platform: uptime
+    id: gateway_uptime_s
+    internal: true
+
+  # ===== BMS 1 Parser =====
+  - platform: ble_client
+    type: characteristic
+    id: bms1_raw_notify
+    internal: true
+    ble_client_id: bms1_ble_client
+    service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb"
+    characteristic_uuid: "0000ffe1-0000-1000-8000-00805f9b34fb"
+    notify: true
+    lambda: |-
+      if (x.size() != 105) {
+        ESP_LOGW("BMS1", "Invalid frame length: %u", (unsigned int)x.size());
+        return NAN;
+      }
+
+      uint32_t checksum_sum = 0;
+      for (size_t i = 0; i < 104; i++) {
+        checksum_sum += x[i];
+      }
+      bool checksum_ok = ((checksum_sum & 0xFF) == x[104]);
+      if (!checksum_ok) {
+        ESP_LOGW("BMS1", "Checksum mismatch: calc=0x%02X recv=0x%02X", (unsigned int)(checksum_sum & 0xFF), (unsigned int)x[104]);
+        return NAN;
+      }
+
+      auto u16le = [&](size_t p) -> uint16_t {
+        if (p + 1 >= x.size()) return 0;
+        return (uint16_t)x[p] | ((uint16_t)x[p + 1] << 8);
+      };
+      auto u32le = [&](size_t p) -> uint32_t {
+        if (p + 3 >= x.size()) return 0;
+        return (uint32_t)x[p] |
+               ((uint32_t)x[p + 1] << 8) |
+               ((uint32_t)x[p + 2] << 16) |
+               ((uint32_t)x[p + 3] << 24);
+      };
+      auto s16le = [&](size_t p) -> int16_t {
+        return (int16_t)u16le(p);
+      };
+      auto s32le = [&](size_t p) -> int32_t {
+        return (int32_t)u32le(p);
+      };
+
+      id(bms1_pack_voltage_mv) = (uint16_t)u32le(8);
+      id(bms1_voltage_mv) = (uint16_t)u32le(12);
+      id(bms1_current_ma) = (int16_t)s32le(48);
+      id(bms1_remain_ah) = (uint16_t)((u16le(62) + 50) / 100);
+      id(bms1_factory_ah) = (uint16_t)((u16le(64) + 50) / 100);
+      id(bms1_cell_temp) = u16le(52);
+      id(bms1_mosfet_temp) = u16le(54);
+      id(bms1_cell1_mv) = u16le(16);
+      id(bms1_cell2_mv) = u16le(18);
+      id(bms1_cell3_mv) = u16le(20);
+      id(bms1_cell4_mv) = u16le(22);
+      id(bms1_equil_state) = (uint8_t)u32le(84);
+      id(bms1_protect_state) = (uint8_t)u32le(76);
+      id(bms1_soc) = (uint8_t)u16le(90);
+      id(bms1_soh) = (uint8_t)u16le(92);
+
+      id(bms1_status_flags) = u32le(68);
+      id(bms1_discharge_off) = (id(bms1_status_flags) & 0x80U) != 0U;
+      id(bms1_discharge_switch_state) = id(bms1_discharge_off) ? 0 : 1;
+      id(bms1_operating_mode_raw) = (uint8_t)u16le(88);
+
+      uint32_t cycle_primary = u32le(96);
+      uint32_t cycle_legacy = (uint32_t)u16le(66);
+      bool cycle_primary_plausible = cycle_primary > 0 && cycle_primary < 1000000UL;
+      id(bms1_cycle_count) = cycle_primary_plausible ? cycle_primary : cycle_legacy;
+
+      uint32_t discharge_primary = u32le(100);
+      uint32_t discharge_legacy = u32le(68);
+      bool discharge_primary_plausible = discharge_primary > 0 && discharge_primary < 100000000UL;
+      id(bms1_discharge_ah_count) = discharge_primary_plausible ? discharge_primary : discharge_legacy;
+
+      if (std::string("${debug_status_flags_hex}") == "true") {
+        ESP_LOGW("BMS1", "status_flags=0x%08X discharge_off=%s", (unsigned int)id(bms1_status_flags), id(bms1_discharge_off) ? "true" : "false");
+      }
+
+      if (std::string("${publish_raw_frame_hex}") == "true") {
+        static const char *hex_chars = "0123456789ABCDEF";
+        std::string frame_hex;
+        frame_hex.reserve(x.size() * 2);
+        for (uint8_t b : x) {
+          frame_hex.push_back(hex_chars[(b >> 4) & 0x0F]);
+          frame_hex.push_back(hex_chars[b & 0x0F]);
+        }
+        id(bms1_last_frame_hex) = frame_hex;
+      }
+
+      id(bms1_frame_received) = true;
+      id(bms1_connected) = true;
+      auto now = id(sntp_time).now();
+      if (now.is_valid()) {
+        id(bms1_last_read_epoch) = (uint32_t)now.timestamp;
+      }
+
+      return (float)x.size();
+    update_interval: never
+
+  # ===== BMS 2 Parser (identical) =====
+  - platform: ble_client
+    type: characteristic
+    id: bms2_raw_notify
+    internal: true
+    ble_client_id: bms2_ble_client
+    service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb"
+    characteristic_uuid: "0000ffe1-0000-1000-8000-00805f9b34fb"
+    notify: true
+    lambda: |-
+      if (x.size() != 105) {
+        ESP_LOGW("BMS2", "Invalid frame length: %u", (unsigned int)x.size());
+        return NAN;
+      }
+
+      uint32_t checksum_sum = 0;
+      for (size_t i = 0; i < 104; i++) {
+        checksum_sum += x[i];
+      }
+      bool checksum_ok = ((checksum_sum & 0xFF) == x[104]);
+      if (!checksum_ok) {
+        ESP_LOGW("BMS2", "Checksum mismatch: calc=0x%02X recv=0x%02X", (unsigned int)(checksum_sum & 0xFF), (unsigned int)x[104]);
+        return NAN;
+      }
+
+      auto u16le = [&](size_t p) -> uint16_t {
+        if (p + 1 >= x.size()) return 0;
+        return (uint16_t)x[p] | ((uint16_t)x[p + 1] << 8);
+      };
+      auto u32le = [&](size_t p) -> uint32_t {
+        if (p + 3 >= x.size()) return 0;
+        return (uint32_t)x[p] |
+               ((uint32_t)x[p + 1] << 8) |
+               ((uint32_t)x[p + 2] << 16) |
+               ((uint32_t)x[p + 3] << 24);
+      };
+      auto s16le = [&](size_t p) -> int16_t {
+        return (int16_t)u16le(p);
+      };
+      auto s32le = [&](size_t p) -> int32_t {
+        return (int32_t)u32le(p);
+      };
+
+      id(bms2_pack_voltage_mv) = (uint16_t)u32le(8);
+      id(bms2_voltage_mv) = (uint16_t)u32le(12);
+      id(bms2_current_ma) = (int16_t)s32le(48);
+      id(bms2_remain_ah) = (uint16_t)((u16le(62) + 50) / 100);
+      id(bms2_factory_ah) = (uint16_t)((u16le(64) + 50) / 100);
+      id(bms2_cell_temp) = u16le(52);
+      id(bms2_mosfet_temp) = u16le(54);
+      id(bms2_cell1_mv) = u16le(16);
+      id(bms2_cell2_mv) = u16le(18);
+      id(bms2_cell3_mv) = u16le(20);
+      id(bms2_cell4_mv) = u16le(22);
+      id(bms2_equil_state) = (uint8_t)u32le(84);
+      id(bms2_protect_state) = (uint8_t)u32le(76);
+      id(bms2_soc) = (uint8_t)u16le(90);
+      id(bms2_soh) = (uint8_t)u16le(92);
+
+      id(bms2_status_flags) = u32le(68);
+      id(bms2_discharge_off) = (id(bms2_status_flags) & 0x80U) != 0U;
+      id(bms2_discharge_switch_state) = id(bms2_discharge_off) ? 0 : 1;
+      id(bms2_operating_mode_raw) = (uint8_t)u16le(88);
+
+      uint32_t cycle_primary = u32le(96);
+      uint32_t cycle_legacy = (uint32_t)u16le(66);
+      bool cycle_primary_plausible = cycle_primary > 0 && cycle_primary < 1000000UL;
+      id(bms2_cycle_count) = cycle_primary_plausible ? cycle_primary : cycle_legacy;
+
+      uint32_t discharge_primary = u32le(100);
+      uint32_t discharge_legacy = u32le(68);
+      bool discharge_primary_plausible = discharge_primary > 0 && discharge_primary < 100000000UL;
+      id(bms2_discharge_ah_count) = discharge_primary_plausible ? discharge_primary : discharge_legacy;
+
+      if (std::string("${debug_status_flags_hex}") == "true") {
+        ESP_LOGW("BMS2", "status_flags=0x%08X discharge_off=%s", (unsigned int)id(bms2_status_flags), id(bms2_discharge_off) ? "true" : "false");
+      }
+
+      if (std::string("${publish_raw_frame_hex}") == "true") {
+        static const char *hex_chars = "0123456789ABCDEF";
+        std::string frame_hex;
+        frame_hex.reserve(x.size() * 2);
+        for (uint8_t b : x) {
+          frame_hex.push_back(hex_chars[(b >> 4) & 0x0F]);
+          frame_hex.push_back(hex_chars[b & 0x0F]);
+        }
+        id(bms2_last_frame_hex) = frame_hex;
+      }
+
+      id(bms2_frame_received) = true;
+      id(bms2_connected) = true;
+      auto now = id(sntp_time).now();
+      if (now.is_valid()) {
+        id(bms2_last_read_epoch) = (uint32_t)now.timestamp;
+      }
+
+      return (float)x.size();
+    update_interval: never
+
+  # ===== BMS 3 Parser =====
+  - platform: ble_client
+    type: characteristic
+    id: bms3_raw_notify
+    internal: true
+    ble_client_id: bms3_ble_client
+    service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb"
+    characteristic_uuid: "0000ffe1-0000-1000-8000-00805f9b34fb"
+    notify: true
+    lambda: |-
+      if (x.size() != 105) {
+        ESP_LOGW("BMS3", "Invalid frame length: %u", (unsigned int)x.size());
+        return NAN;
+      }
+      uint32_t checksum_sum = 0;
+      for (size_t i = 0; i < 104; i++) checksum_sum += x[i];
+      bool checksum_ok = ((checksum_sum & 0xFF) == x[104]);
+      if (!checksum_ok) {
+        ESP_LOGW("BMS3", "Checksum mismatch: calc=0x%02X recv=0x%02X", (unsigned int)(checksum_sum & 0xFF), (unsigned int)x[104]);
+        return NAN;
+      }
+      auto u16le = [&](size_t p) -> uint16_t {
+        if (p + 1 >= x.size()) return 0;
+        return (uint16_t)x[p] | ((uint16_t)x[p + 1] << 8);
+      };
+      auto u32le = [&](size_t p) -> uint32_t {
+        if (p + 3 >= x.size()) return 0;
+        return (uint32_t)x[p] | ((uint32_t)x[p + 1] << 8) | ((uint32_t)x[p + 2] << 16) | ((uint32_t)x[p + 3] << 24);
+      };
+      auto s16le = [&](size_t p) -> int16_t { return (int16_t)u16le(p); };
+      auto s32le = [&](size_t p) -> int32_t { return (int32_t)u32le(p); };
+
+      id(bms3_pack_voltage_mv) = (uint16_t)u32le(8);
+      id(bms3_voltage_mv) = (uint16_t)u32le(12);
+      id(bms3_current_ma) = (int16_t)s32le(48);
+      id(bms3_remain_ah) = (uint16_t)((u16le(62) + 50) / 100);
+      id(bms3_factory_ah) = (uint16_t)((u16le(64) + 50) / 100);
+      id(bms3_cell_temp) = u16le(52);
+      id(bms3_mosfet_temp) = u16le(54);
+      id(bms3_cell1_mv) = u16le(16);
+      id(bms3_cell2_mv) = u16le(18);
+      id(bms3_cell3_mv) = u16le(20);
+      id(bms3_cell4_mv) = u16le(22);
+      id(bms3_equil_state) = (uint8_t)u32le(84);
+      id(bms3_protect_state) = (uint8_t)u32le(76);
+      id(bms3_soc) = (uint8_t)u16le(90);
+      id(bms3_soh) = (uint8_t)u16le(92);
+
+      id(bms3_status_flags) = u32le(68);
+      id(bms3_discharge_off) = (id(bms3_status_flags) & 0x80U) != 0U;
+      id(bms3_discharge_switch_state) = id(bms3_discharge_off) ? 0 : 1;
+      id(bms3_operating_mode_raw) = (uint8_t)u16le(88);
+
+      uint32_t cycle_primary = u32le(96);
+      uint32_t cycle_legacy = (uint32_t)u16le(66);
+      bool cycle_primary_plausible = cycle_primary > 0 && cycle_primary < 1000000UL;
+      id(bms3_cycle_count) = cycle_primary_plausible ? cycle_primary : cycle_legacy;
+
+      uint32_t discharge_primary = u32le(100);
+      uint32_t discharge_legacy = u32le(68);
+      bool discharge_primary_plausible = discharge_primary > 0 && discharge_primary < 100000000UL;
+      id(bms3_discharge_ah_count) = discharge_primary_plausible ? discharge_primary : discharge_legacy;
+
+      if (std::string("${debug_status_flags_hex}") == "true") {
+        ESP_LOGW("BMS3", "status_flags=0x%08X discharge_off=%s", (unsigned int)id(bms3_status_flags), id(bms3_discharge_off) ? "true" : "false");
+      }
+
+      if (std::string("${publish_raw_frame_hex}") == "true") {
+        static const char *hex_chars = "0123456789ABCDEF";
+        std::string frame_hex;
+        frame_hex.reserve(x.size() * 2);
+        for (uint8_t b : x) {
+          frame_hex.push_back(hex_chars[(b >> 4) & 0x0F]);
+          frame_hex.push_back(hex_chars[b & 0x0F]);
+        }
+        id(bms3_last_frame_hex) = frame_hex;
+      }
+
+      id(bms3_frame_received) = true;
+      id(bms3_connected) = true;
+      auto now = id(sntp_time).now();
+      if (now.is_valid()) { id(bms3_last_read_epoch) = (uint32_t)now.timestamp; }
+      return (float)x.size();
+    update_interval: never
+
+  # ===== BMS 4 Parser =====
+  - platform: ble_client
+    type: characteristic
+    id: bms4_raw_notify
+    internal: true
+    ble_client_id: bms4_ble_client
+    service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb"
+    characteristic_uuid: "0000ffe1-0000-1000-8000-00805f9b34fb"
+    notify: true
+    lambda: |-
+      if (x.size() != 105) {
+        ESP_LOGW("BMS4", "Invalid frame length: %u", (unsigned int)x.size());
+        return NAN;
+      }
+      uint32_t checksum_sum = 0;
+      for (size_t i = 0; i < 104; i++) checksum_sum += x[i];
+      bool checksum_ok = ((checksum_sum & 0xFF) == x[104]);
+      if (!checksum_ok) {
+        ESP_LOGW("BMS4", "Checksum mismatch: calc=0x%02X recv=0x%02X", (unsigned int)(checksum_sum & 0xFF), (unsigned int)x[104]);
+        return NAN;
+      }
+      auto u16le = [&](size_t p) -> uint16_t {
+        if (p + 1 >= x.size()) return 0;
+        return (uint16_t)x[p] | ((uint16_t)x[p + 1] << 8);
+      };
+      auto u32le = [&](size_t p) -> uint32_t {
+        if (p + 3 >= x.size()) return 0;
+        return (uint32_t)x[p] | ((uint32_t)x[p + 1] << 8) | ((uint32_t)x[p + 2] << 16) | ((uint32_t)x[p + 3] << 24);
+      };
+      auto s16le = [&](size_t p) -> int16_t { return (int16_t)u16le(p); };
+      auto s32le = [&](size_t p) -> int32_t { return (int32_t)u32le(p); };
+
+      id(bms4_pack_voltage_mv) = (uint16_t)u32le(8);
+      id(bms4_voltage_mv) = (uint16_t)u32le(12);
+      id(bms4_current_ma) = (int16_t)s32le(48);
+      id(bms4_remain_ah) = (uint16_t)((u16le(62) + 50) / 100);
+      id(bms4_factory_ah) = (uint16_t)((u16le(64) + 50) / 100);
+      id(bms4_cell_temp) = u16le(52);
+      id(bms4_mosfet_temp) = u16le(54);
+      id(bms4_cell1_mv) = u16le(16);
+      id(bms4_cell2_mv) = u16le(18);
+      id(bms4_cell3_mv) = u16le(20);
+      id(bms4_cell4_mv) = u16le(22);
+      id(bms4_equil_state) = (uint8_t)u32le(84);
+      id(bms4_protect_state) = (uint8_t)u32le(76);
+      id(bms4_soc) = (uint8_t)u16le(90);
+      id(bms4_soh) = (uint8_t)u16le(92);
+
+      id(bms4_status_flags) = u32le(68);
+      id(bms4_discharge_off) = (id(bms4_status_flags) & 0x80U) != 0U;
+      id(bms4_discharge_switch_state) = id(bms4_discharge_off) ? 0 : 1;
+      id(bms4_operating_mode_raw) = (uint8_t)u16le(88);
+
+      uint32_t cycle_primary = u32le(96);
+      uint32_t cycle_legacy = (uint32_t)u16le(66);
+      bool cycle_primary_plausible = cycle_primary > 0 && cycle_primary < 1000000UL;
+      id(bms4_cycle_count) = cycle_primary_plausible ? cycle_primary : cycle_legacy;
+
+      uint32_t discharge_primary = u32le(100);
+      uint32_t discharge_legacy = u32le(68);
+      bool discharge_primary_plausible = discharge_primary > 0 && discharge_primary < 100000000UL;
+      id(bms4_discharge_ah_count) = discharge_primary_plausible ? discharge_primary : discharge_legacy;
+
+      if (std::string("${debug_status_flags_hex}") == "true") {
+        ESP_LOGW("BMS4", "status_flags=0x%08X discharge_off=%s", (unsigned int)id(bms4_status_flags), id(bms4_discharge_off) ? "true" : "false");
+      }
+
+      if (std::string("${publish_raw_frame_hex}") == "true") {
+        static const char *hex_chars = "0123456789ABCDEF";
+        std::string frame_hex;
+        frame_hex.reserve(x.size() * 2);
+        for (uint8_t b : x) {
+          frame_hex.push_back(hex_chars[(b >> 4) & 0x0F]);
+          frame_hex.push_back(hex_chars[b & 0x0F]);
+        }
+        id(bms4_last_frame_hex) = frame_hex;
+      }
+
+      id(bms4_frame_received) = true;
+      id(bms4_connected) = true;
+      auto now = id(sntp_time).now();
+      if (now.is_valid()) { id(bms4_last_read_epoch) = (uint32_t)now.timestamp; }
+      return (float)x.size();
+    update_interval: never
+
+  - platform: ble_client
+    type: characteristic
+    id: bms5_raw_notify
+    internal: true
+    ble_client_id: bms5_ble_client
+    service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb"
+    characteristic_uuid: "0000ffe1-0000-1000-8000-00805f9b34fb"
+    notify: true
+    lambda: |-
+      if (x.size() != 105) {
+        ESP_LOGW("BMS5", "Invalid frame length: %u", (unsigned int)x.size());
+        return NAN;
+      }
+      uint32_t checksum_sum = 0;
+      for (size_t i = 0; i < 104; i++) checksum_sum += x[i];
+      bool checksum_ok = ((checksum_sum & 0xFF) == x[104]);
+      if (!checksum_ok) {
+        ESP_LOGW("BMS5", "Checksum mismatch: calc=0x%02X recv=0x%02X", (unsigned int)(checksum_sum & 0xFF), (unsigned int)x[104]);
+        return NAN;
+      }
+      auto u16le = [&](size_t p) -> uint16_t {
+        if (p + 1 >= x.size()) return 0;
+        return (uint16_t)x[p] | ((uint16_t)x[p + 1] << 8);
+      };
+      auto u32le = [&](size_t p) -> uint32_t {
+        if (p + 3 >= x.size()) return 0;
+        return (uint32_t)x[p] | ((uint32_t)x[p + 1] << 8) | ((uint32_t)x[p + 2] << 16) | ((uint32_t)x[p + 3] << 24);
+      };
+      auto s16le = [&](size_t p) -> int16_t { return (int16_t)u16le(p); };
+      auto s32le = [&](size_t p) -> int32_t { return (int32_t)u32le(p); };
+
+      id(bms5_pack_voltage_mv) = (uint16_t)u32le(8);
+      id(bms5_voltage_mv) = (uint16_t)u32le(12);
+      id(bms5_current_ma) = (int16_t)s32le(48);
+      id(bms5_remain_ah) = (uint16_t)((u16le(62) + 50) / 100);
+      id(bms5_factory_ah) = (uint16_t)((u16le(64) + 50) / 100);
+      id(bms5_cell_temp) = u16le(52);
+      id(bms5_mosfet_temp) = u16le(54);
+      id(bms5_cell1_mv) = u16le(16);
+      id(bms5_cell2_mv) = u16le(18);
+      id(bms5_cell3_mv) = u16le(20);
+      id(bms5_cell4_mv) = u16le(22);
+      id(bms5_equil_state) = (uint8_t)u32le(84);
+      id(bms5_protect_state) = (uint8_t)u32le(76);
+      id(bms5_soc) = (uint8_t)u16le(90);
+      id(bms5_soh) = (uint8_t)u16le(92);
+
+      id(bms5_status_flags) = u32le(68);
+      id(bms5_discharge_off) = (id(bms5_status_flags) & 0x80U) != 0U;
+      id(bms5_discharge_switch_state) = id(bms5_discharge_off) ? 0 : 1;
+      id(bms5_operating_mode_raw) = (uint8_t)u16le(88);
+
+      uint32_t cycle_primary = u32le(96);
+      uint32_t cycle_legacy = (uint32_t)u16le(66);
+      bool cycle_primary_plausible = cycle_primary > 0 && cycle_primary < 1000000UL;
+      id(bms5_cycle_count) = cycle_primary_plausible ? cycle_primary : cycle_legacy;
+
+      uint32_t discharge_primary = u32le(100);
+      uint32_t discharge_legacy = u32le(68);
+      bool discharge_primary_plausible = discharge_primary > 0 && discharge_primary < 100000000UL;
+      id(bms5_discharge_ah_count) = discharge_primary_plausible ? discharge_primary : discharge_legacy;
+
+      if (std::string("${debug_status_flags_hex}") == "true") {
+        ESP_LOGW("BMS5", "status_flags=0x%08X discharge_off=%s", (unsigned int)id(bms5_status_flags), id(bms5_discharge_off) ? "true" : "false");
+      }
+
+      if (std::string("${publish_raw_frame_hex}") == "true") {
+        static const char *hex_chars = "0123456789ABCDEF";
+        std::string frame_hex;
+        frame_hex.reserve(x.size() * 2);
+        for (uint8_t b : x) {
+          frame_hex.push_back(hex_chars[(b >> 4) & 0x0F]);
+          frame_hex.push_back(hex_chars[b & 0x0F]);
+        }
+        id(bms5_last_frame_hex) = frame_hex;
+      }
+
+      id(bms5_frame_received) = true;
+      id(bms5_connected) = true;
+      auto now = id(sntp_time).now();
+      if (now.is_valid()) { id(bms5_last_read_epoch) = (uint32_t)now.timestamp; }
+      return (float)x.size();
+    update_interval: never
+
+  - platform: ble_client
+    type: characteristic
+    id: bms6_raw_notify
+    internal: true
+    ble_client_id: bms6_ble_client
+    service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb"
+    characteristic_uuid: "0000ffe1-0000-1000-8000-00805f9b34fb"
+    notify: true
+    lambda: |-
+      if (x.size() != 105) {
+        ESP_LOGW("BMS6", "Invalid frame length: %u", (unsigned int)x.size());
+        return NAN;
+      }
+      uint32_t checksum_sum = 0;
+      for (size_t i = 0; i < 104; i++) checksum_sum += x[i];
+      bool checksum_ok = ((checksum_sum & 0xFF) == x[104]);
+      if (!checksum_ok) {
+        ESP_LOGW("BMS6", "Checksum mismatch: calc=0x%02X recv=0x%02X", (unsigned int)(checksum_sum & 0xFF), (unsigned int)x[104]);
+        return NAN;
+      }
+      auto u16le = [&](size_t p) -> uint16_t {
+        if (p + 1 >= x.size()) return 0;
+        return (uint16_t)x[p] | ((uint16_t)x[p + 1] << 8);
+      };
+      auto u32le = [&](size_t p) -> uint32_t {
+        if (p + 3 >= x.size()) return 0;
+        return (uint32_t)x[p] | ((uint32_t)x[p + 1] << 8) | ((uint32_t)x[p + 2] << 16) | ((uint32_t)x[p + 3] << 24);
+      };
+      auto s16le = [&](size_t p) -> int16_t { return (int16_t)u16le(p); };
+      auto s32le = [&](size_t p) -> int32_t { return (int32_t)u32le(p); };
+
+      id(bms6_pack_voltage_mv) = (uint16_t)u32le(8);
+      id(bms6_voltage_mv) = (uint16_t)u32le(12);
+      id(bms6_current_ma) = (int16_t)s32le(48);
+      id(bms6_remain_ah) = (uint16_t)((u16le(62) + 50) / 100);
+      id(bms6_factory_ah) = (uint16_t)((u16le(64) + 50) / 100);
+      id(bms6_cell_temp) = u16le(52);
+      id(bms6_mosfet_temp) = u16le(54);
+      id(bms6_cell1_mv) = u16le(16);
+      id(bms6_cell2_mv) = u16le(18);
+      id(bms6_cell3_mv) = u16le(20);
+      id(bms6_cell4_mv) = u16le(22);
+      id(bms6_equil_state) = (uint8_t)u32le(84);
+      id(bms6_protect_state) = (uint8_t)u32le(76);
+      id(bms6_soc) = (uint8_t)u16le(90);
+      id(bms6_soh) = (uint8_t)u16le(92);
+
+      id(bms6_status_flags) = u32le(68);
+      id(bms6_discharge_off) = (id(bms6_status_flags) & 0x80U) != 0U;
+      id(bms6_discharge_switch_state) = id(bms6_discharge_off) ? 0 : 1;
+      id(bms6_operating_mode_raw) = (uint8_t)u16le(88);
+
+      uint32_t cycle_primary = u32le(96);
+      uint32_t cycle_legacy = (uint32_t)u16le(66);
+      bool cycle_primary_plausible = cycle_primary > 0 && cycle_primary < 1000000UL;
+      id(bms6_cycle_count) = cycle_primary_plausible ? cycle_primary : cycle_legacy;
+
+      uint32_t discharge_primary = u32le(100);
+      uint32_t discharge_legacy = u32le(68);
+      bool discharge_primary_plausible = discharge_primary > 0 && discharge_primary < 100000000UL;
+      id(bms6_discharge_ah_count) = discharge_primary_plausible ? discharge_primary : discharge_legacy;
+
+      if (std::string("${debug_status_flags_hex}") == "true") {
+        ESP_LOGW("BMS6", "status_flags=0x%08X discharge_off=%s", (unsigned int)id(bms6_status_flags), id(bms6_discharge_off) ? "true" : "false");
+      }
+
+      if (std::string("${publish_raw_frame_hex}") == "true") {
+        static const char *hex_chars = "0123456789ABCDEF";
+        std::string frame_hex;
+        frame_hex.reserve(x.size() * 2);
+        for (uint8_t b : x) {
+          frame_hex.push_back(hex_chars[(b >> 4) & 0x0F]);
+          frame_hex.push_back(hex_chars[b & 0x0F]);
+        }
+        id(bms6_last_frame_hex) = frame_hex;
+      }
+
+      id(bms6_frame_received) = true;
+      id(bms6_connected) = true;
+      auto now = id(sntp_time).now();
+      if (now.is_valid()) { id(bms6_last_read_epoch) = (uint32_t)now.timestamp; }
+      return (float)x.size();
+    update_interval: never
+
+# ═══════════════════════════════════════════════════════════════════════
+# BINARY & TEXT SENSORS
+# ═══════════════════════════════════════════════════════════════════════
+binary_sensor:
+  - platform: template
+    id: bms1_connected_status
+    name: "BMS 1 Connected"
+    device_class: connectivity
+    lambda: return id(bms1_connected);
+
+  - platform: template
+    id: bms2_connected_status
+    name: "BMS 2 Connected"
+    device_class: connectivity
+    lambda: return id(bms2_connected);
+
+  - platform: template
+    id: bms1_discharge_off_status
+    name: "BMS 1 Discharge Off"
+    lambda: return id(bms1_discharge_off);
+
+  - platform: template
+    id: bms2_discharge_off_status
+    name: "BMS 2 Discharge Off"
+    lambda: return id(bms2_discharge_off);
+
+  - platform: template
+    id: bms3_discharge_off_status
+    name: "BMS 3 Discharge Off"
+    lambda: return id(bms3_discharge_off);
+
+  - platform: template
+    id: bms4_discharge_off_status
+    name: "BMS 4 Discharge Off"
+    lambda: return id(bms4_discharge_off);
+
+  - platform: template
+    id: bms5_discharge_off_status
+    name: "BMS 5 Discharge Off"
+    lambda: return id(bms5_discharge_off);
+
+  - platform: template
+    id: bms6_discharge_off_status
+    name: "BMS 6 Discharge Off"
+    lambda: return id(bms6_discharge_off);
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      id: gateway_ip_address
+      internal: true
+    ssid:
+      id: gateway_wifi_ssid
+      internal: true
+    bssid:
+      id: gateway_wifi_bssid
+      internal: true
+
+# ═══════════════════════════════════════════════════════════════════════
+# SCRIPTS — discovery, status, recovery, per-slot read/publish, HA discovery
+# ═══════════════════════════════════════════════════════════════════════
+script:
+  # ── Discovery trigger ─────────────────────────────────────────────────
+  - id: publish_ha_discovery_if_needed
+    then:
+      - lambda: |-
+          if (!id(mqtt_client).is_connected()) {
+            return;
+          }
+
+          auto now = id(sntp_time).now();
+          uint32_t ts = now.is_valid() ? (uint32_t) now.timestamp : 0;
+          uint32_t last = id(discovery_last_publish_epoch);
+          const uint32_t min_interval_s = 300;
+
+          bool should_publish = false;
+          if (last == 0) {
+            should_publish = true;
+          } else if (last == 1 && ts > 0) {
+            should_publish = true;
+          } else if (ts > 0 && last > 1 && (ts - last) >= min_interval_s) {
+            should_publish = true;
+          }
+
+          if (should_publish) {
+            ESP_LOGW("DISCOVERY", "Trigger discovery publish (ts=%u, last=%u)", ts, last);
+            id(publish_ha_discovery).execute();
+          }
+
+  # ── Gateway status ────────────────────────────────────────────────────
+  - id: publish_gateway_status
+    then:
+      - lambda: |-
+          const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + std::string("${gateway_name}") + "/";
+          auto publish_value = [&](const std::string &field, const std::string &value) {
+            id(mqtt_client).publish(base_topic + field, value, 0, false);
+          };
+
+          auto now = id(sntp_time).now();
+          uint32_t ts = now.is_valid() ? (uint32_t) now.timestamp : 0;
+
+          publish_value("timestamp", esphome::to_string(ts));
+          publish_value("gateway_name", "${gateway_name}");
+          publish_value("gateway_friendly_name", "${gateway_friendly_name}");
+          publish_value("data_prefix", "${mqtt_topic_prefix}");
+          publish_value("discovery_prefix", "${ha_discovery_prefix}");
+          publish_value("wifi_connected", wifi::global_wifi_component->is_connected() ? "true" : "false");
+          publish_value("mqtt_connected", id(mqtt_client).is_connected() ? "true" : "false");
+          publish_value("read_cycle_running", id(read_cycle_running) ? "true" : "false");
+          publish_value("read_cycle_start_epoch", esphome::to_string(id(read_cycle_start_epoch)));
+          publish_value("read_cycle_last_success_epoch", esphome::to_string(id(read_cycle_last_success_epoch)));
+          publish_value("watchdog_recovery_count", esphome::to_string(id(watchdog_recovery_count)));
+
+          std::string ip = id(gateway_ip_address).has_state() ? id(gateway_ip_address).state : std::string("");
+          std::string ssid = id(gateway_wifi_ssid).has_state() ? id(gateway_wifi_ssid).state : std::string("");
+          std::string bssid = id(gateway_wifi_bssid).has_state() ? id(gateway_wifi_bssid).state : std::string("");
+          publish_value("ip_address", ip.empty() ? "0.0.0.0" : ip);
+          publish_value("wifi_ssid", ssid.empty() ? "unknown" : ssid);
+          publish_value("wifi_bssid", bssid.empty() ? "unknown" : bssid);
+
+          if (id(gateway_uptime_s).has_state()) {
+            publish_value("uptime_s", esphome::to_string((uint32_t) id(gateway_uptime_s).state));
+          }
+
+  # ===== RECOVERY =====
+  - id: recover_from_stuck_cycle
+    mode: single
+    then:
+      - logger.log:
+          level: WARN
+          format: "Watchdog recovery: stopping scripts, disconnecting BLE clients, restarting scan"
+      - script.stop: read_bms1
+      - script.stop: read_bms2
+      - script.stop: read_bms3
+      - script.stop: read_bms4
+      - script.stop: read_bms5
+      - script.stop: read_bms6
+      - script.stop: read_and_publish_all
+      - ble_client.disconnect: bms1_ble_client
+      - ble_client.disconnect: bms2_ble_client
+      - ble_client.disconnect: bms3_ble_client
+      - ble_client.disconnect: bms4_ble_client
+      - ble_client.disconnect: bms5_ble_client
+      - ble_client.disconnect: bms6_ble_client
+      - esp32_ble_tracker.start_scan:
+      - lambda: |-
+          id(read_cycle_running) = false;
+          id(read_cycle_start_epoch) = 0;
+
+  # ===== PUBLISH BMS 1 =====
+  - id: publish_bms1
+    then:
+      - lambda: |-
+          if (id(bms1_voltage_mv) == 0) {
+            return;
+          }
+
+          id(publish_ha_discovery_if_needed).execute();
+
+          std::string ble_name = "${bms1_name}";
+          std::string ble_mac = !std::string("${bms1_mac}").empty() ? std::string("${bms1_mac}") : id(bms1_bound_mac);
+          float power_w = ((float)id(bms1_voltage_mv) / 1000.0f) * ((float)id(bms1_current_ma) / 1000.0f);
+
+          auto now = id(sntp_time).now();
+          uint32_t ts = id(bms1_last_read_epoch) > 0 ? id(bms1_last_read_epoch) : (now.is_valid() ? (uint32_t)now.timestamp : 0);
+          int rssi = id(bms1_rssi);
+          int rssi_quality_pct = rssi <= -100 ? 0 : (rssi >= -50 ? 100 : (2 * (rssi + 100)));
+          const char *rssi_quality = rssi >= -60 ? "excellent" : (rssi >= -70 ? "good" : (rssi >= -80 ? "fair" : (rssi >= -90 ? "weak" : "very_weak")));
+          uint16_t cell_max_mv = id(bms1_cell1_mv);
+          uint16_t cell_min_mv = id(bms1_cell1_mv);
+          if (id(bms1_cell2_mv) > cell_max_mv) cell_max_mv = id(bms1_cell2_mv);
+          if (id(bms1_cell3_mv) > cell_max_mv) cell_max_mv = id(bms1_cell3_mv);
+          if (id(bms1_cell4_mv) > cell_max_mv) cell_max_mv = id(bms1_cell4_mv);
+          if (id(bms1_cell2_mv) < cell_min_mv) cell_min_mv = id(bms1_cell2_mv);
+          if (id(bms1_cell3_mv) < cell_min_mv) cell_min_mv = id(bms1_cell3_mv);
+          if (id(bms1_cell4_mv) < cell_min_mv) cell_min_mv = id(bms1_cell4_mv);
+          uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
+          const char *cell_delta_status = cell_delta_mv <= 10 ? "excellent" : (cell_delta_mv <= 25 ? "good" : (cell_delta_mv <= 40 ? "normal" : (cell_delta_mv <= 60 ? "warning" : "critical")));
+          const char *cell_voltage_status = cell_min_mv < 2900 ? "critical_low" : (cell_min_mv < 3050 ? "low" : (cell_min_mv < 3500 ? "normal" : "high"));
+          const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
+          auto publish_value = [&](const std::string &field, const std::string &value) {
+            id(mqtt_client).publish(base_topic + field, value, 0, false);
+          };
+
+          publish_value("timestamp", esphome::to_string(ts));
+          publish_value("ble_name", ble_name);
+          publish_value("ble_mac", ble_mac);
+          publish_value("rssi", esphome::to_string(rssi));
+          publish_value("rssi_quality_pct", esphome::to_string(rssi_quality_pct));
+          publish_value("rssi_quality", rssi_quality);
+          publish_value("voltage_mv", esphome::to_string(id(bms1_voltage_mv)));
+          publish_value("current_ma", esphome::to_string(id(bms1_current_ma)));
+          publish_value("power_w", esphome::str_sprintf("%.3f", power_w));
+          publish_value("pack_voltage_mv", esphome::to_string(id(bms1_pack_voltage_mv)));
+          publish_value("remain_ah", esphome::to_string(id(bms1_remain_ah)));
+          publish_value("factory_ah", esphome::to_string(id(bms1_factory_ah)));
+          publish_value("cell_temp", esphome::to_string((int)id(bms1_cell_temp)));
+          publish_value("mosfet_temp", esphome::to_string((int)id(bms1_mosfet_temp)));
+          publish_value("soc", esphome::to_string(id(bms1_soc)));
+          publish_value("soh", esphome::to_string(id(bms1_soh)));
+          publish_value("cell1_mv", esphome::to_string(id(bms1_cell1_mv)));
+          publish_value("cell2_mv", esphome::to_string(id(bms1_cell2_mv)));
+          publish_value("cell3_mv", esphome::to_string(id(bms1_cell3_mv)));
+          publish_value("cell4_mv", esphome::to_string(id(bms1_cell4_mv)));
+          publish_value("cell_min_mv", esphome::to_string(cell_min_mv));
+          publish_value("cell_max_mv", esphome::to_string(cell_max_mv));
+          publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
+          publish_value("cell_delta_status", cell_delta_status);
+          publish_value("cell_voltage_status", cell_voltage_status);
+          publish_value("equil_state", esphome::to_string(id(bms1_equil_state)));
+          std::string bms1_equil_cell;
+          uint8_t bms1_eq = id(bms1_equil_state);
+          if (bms1_eq & 0x01) bms1_equil_cell += (bms1_equil_cell.empty() ? "" : ",") + std::string("cell1");
+          if (bms1_eq & 0x02) bms1_equil_cell += (bms1_equil_cell.empty() ? "" : ",") + std::string("cell2");
+          if (bms1_eq & 0x04) bms1_equil_cell += (bms1_equil_cell.empty() ? "" : ",") + std::string("cell3");
+          if (bms1_eq & 0x08) bms1_equil_cell += (bms1_equil_cell.empty() ? "" : ",") + std::string("cell4");
+          publish_value("equil_cell", bms1_equil_cell.empty() ? "none" : bms1_equil_cell);
+          publish_value("protect_state", esphome::to_string(id(bms1_protect_state)));
+          publish_value("discharge_switch", id(bms1_discharge_off) ? "OFF" : "ON");
+          const char *bms1_operating_mode = id(bms1_operating_mode_raw) == 0 ? "idle" : (id(bms1_operating_mode_raw) == 1 ? "charge" : (id(bms1_operating_mode_raw) == 2 ? "discharge" : "unknown"));
+          publish_value("operating_mode_raw", esphome::to_string(id(bms1_operating_mode_raw)));
+          publish_value("operating_mode", bms1_operating_mode);
+          if (id(bms1_discharge_off)) {
+            publish_value("voltage_context", "discharge_off_terminal_voltage_may_drop");
+          } else {
+            publish_value("voltage_context", "normal_output_or_charge_path_voltage");
+          }
+          publish_value("cycle_count", esphome::to_string(id(bms1_cycle_count)));
+          publish_value("discharge_ah_count", esphome::to_string(id(bms1_discharge_ah_count)));
+          if (std::string("${debug_status_flags_hex}") == "true") {
+            publish_value("status_flags_hex", esphome::str_sprintf("0x%08X", (unsigned int)id(bms1_status_flags)));
+          }
+          if (std::string("${publish_raw_frame_hex}") == "true" && !id(bms1_last_frame_hex).empty()) {
+            id(mqtt_client).publish(base_topic + "raw_frame_hex", id(bms1_last_frame_hex), 0, false);
+          }
+
+  # ===== PUBLISH BMS 2 =====
+  - id: publish_bms2
+    then:
+      - lambda: |-
+          if (id(bms2_voltage_mv) == 0) {
+            return;
+          }
+
+          id(publish_ha_discovery_if_needed).execute();
+
+          std::string ble_name = "${bms2_name}";
+          std::string ble_mac = !std::string("${bms2_mac}").empty() ? std::string("${bms2_mac}") : id(bms2_bound_mac);
+          float power_w = ((float)id(bms2_voltage_mv) / 1000.0f) * ((float)id(bms2_current_ma) / 1000.0f);
+
+          auto now = id(sntp_time).now();
+          uint32_t ts = id(bms2_last_read_epoch) > 0 ? id(bms2_last_read_epoch) : (now.is_valid() ? (uint32_t)now.timestamp : 0);
+          int rssi = id(bms2_rssi);
+          int rssi_quality_pct = rssi <= -100 ? 0 : (rssi >= -50 ? 100 : (2 * (rssi + 100)));
+          const char *rssi_quality = rssi >= -60 ? "excellent" : (rssi >= -70 ? "good" : (rssi >= -80 ? "fair" : (rssi >= -90 ? "weak" : "very_weak")));
+          uint16_t cell_max_mv = id(bms2_cell1_mv);
+          uint16_t cell_min_mv = id(bms2_cell1_mv);
+          if (id(bms2_cell2_mv) > cell_max_mv) cell_max_mv = id(bms2_cell2_mv);
+          if (id(bms2_cell3_mv) > cell_max_mv) cell_max_mv = id(bms2_cell3_mv);
+          if (id(bms2_cell4_mv) > cell_max_mv) cell_max_mv = id(bms2_cell4_mv);
+          if (id(bms2_cell2_mv) < cell_min_mv) cell_min_mv = id(bms2_cell2_mv);
+          if (id(bms2_cell3_mv) < cell_min_mv) cell_min_mv = id(bms2_cell3_mv);
+          if (id(bms2_cell4_mv) < cell_min_mv) cell_min_mv = id(bms2_cell4_mv);
+          uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
+          const char *cell_delta_status = cell_delta_mv <= 10 ? "excellent" : (cell_delta_mv <= 25 ? "good" : (cell_delta_mv <= 40 ? "normal" : (cell_delta_mv <= 60 ? "warning" : "critical")));
+          const char *cell_voltage_status = cell_min_mv < 2900 ? "critical_low" : (cell_min_mv < 3050 ? "low" : (cell_min_mv < 3500 ? "normal" : "high"));
+          const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
+          auto publish_value = [&](const std::string &field, const std::string &value) {
+            id(mqtt_client).publish(base_topic + field, value, 0, false);
+          };
+
+          publish_value("timestamp", esphome::to_string(ts));
+          publish_value("ble_name", ble_name);
+          publish_value("ble_mac", ble_mac);
+          publish_value("rssi", esphome::to_string(rssi));
+          publish_value("rssi_quality_pct", esphome::to_string(rssi_quality_pct));
+          publish_value("rssi_quality", rssi_quality);
+          publish_value("voltage_mv", esphome::to_string(id(bms2_voltage_mv)));
+          publish_value("current_ma", esphome::to_string(id(bms2_current_ma)));
+          publish_value("power_w", esphome::str_sprintf("%.3f", power_w));
+          publish_value("pack_voltage_mv", esphome::to_string(id(bms2_pack_voltage_mv)));
+          publish_value("remain_ah", esphome::to_string(id(bms2_remain_ah)));
+          publish_value("factory_ah", esphome::to_string(id(bms2_factory_ah)));
+          publish_value("cell_temp", esphome::to_string((int)id(bms2_cell_temp)));
+          publish_value("mosfet_temp", esphome::to_string((int)id(bms2_mosfet_temp)));
+          publish_value("soc", esphome::to_string(id(bms2_soc)));
+          publish_value("soh", esphome::to_string(id(bms2_soh)));
+          publish_value("cell1_mv", esphome::to_string(id(bms2_cell1_mv)));
+          publish_value("cell2_mv", esphome::to_string(id(bms2_cell2_mv)));
+          publish_value("cell3_mv", esphome::to_string(id(bms2_cell3_mv)));
+          publish_value("cell4_mv", esphome::to_string(id(bms2_cell4_mv)));
+          publish_value("cell_min_mv", esphome::to_string(cell_min_mv));
+          publish_value("cell_max_mv", esphome::to_string(cell_max_mv));
+          publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
+          publish_value("cell_delta_status", cell_delta_status);
+          publish_value("cell_voltage_status", cell_voltage_status);
+          publish_value("equil_state", esphome::to_string(id(bms2_equil_state)));
+          std::string bms2_equil_cell;
+          uint8_t bms2_eq = id(bms2_equil_state);
+          if (bms2_eq & 0x01) bms2_equil_cell += (bms2_equil_cell.empty() ? "" : ",") + std::string("cell1");
+          if (bms2_eq & 0x02) bms2_equil_cell += (bms2_equil_cell.empty() ? "" : ",") + std::string("cell2");
+          if (bms2_eq & 0x04) bms2_equil_cell += (bms2_equil_cell.empty() ? "" : ",") + std::string("cell3");
+          if (bms2_eq & 0x08) bms2_equil_cell += (bms2_equil_cell.empty() ? "" : ",") + std::string("cell4");
+          publish_value("equil_cell", bms2_equil_cell.empty() ? "none" : bms2_equil_cell);
+          publish_value("protect_state", esphome::to_string(id(bms2_protect_state)));
+          publish_value("discharge_switch", id(bms2_discharge_off) ? "OFF" : "ON");
+          const char *bms2_operating_mode = id(bms2_operating_mode_raw) == 0 ? "idle" : (id(bms2_operating_mode_raw) == 1 ? "charge" : (id(bms2_operating_mode_raw) == 2 ? "discharge" : "unknown"));
+          publish_value("operating_mode_raw", esphome::to_string(id(bms2_operating_mode_raw)));
+          publish_value("operating_mode", bms2_operating_mode);
+          if (id(bms2_discharge_off)) {
+            publish_value("voltage_context", "discharge_off_terminal_voltage_may_drop");
+          } else {
+            publish_value("voltage_context", "normal_output_or_charge_path_voltage");
+          }
+          publish_value("cycle_count", esphome::to_string(id(bms2_cycle_count)));
+          publish_value("discharge_ah_count", esphome::to_string(id(bms2_discharge_ah_count)));
+          if (std::string("${debug_status_flags_hex}") == "true") {
+            publish_value("status_flags_hex", esphome::str_sprintf("0x%08X", (unsigned int)id(bms2_status_flags)));
+          }
+          if (std::string("${publish_raw_frame_hex}") == "true" && !id(bms2_last_frame_hex).empty()) {
+            id(mqtt_client).publish(base_topic + "raw_frame_hex", id(bms2_last_frame_hex), 0, false);
+          }
+
+  # ===== PUBLISH BMS 3–6 =====
+  - id: publish_bms3
+    then:
+      - lambda: |-
+          if (id(bms3_voltage_mv) == 0) {
+            return;
+          }
+
+          id(publish_ha_discovery_if_needed).execute();
+
+          std::string ble_name = "${bms3_name}";
+          std::string ble_mac = !std::string("${bms3_mac}").empty() ? std::string("${bms3_mac}") : id(bms3_bound_mac);
+          float power_w = ((float)id(bms3_voltage_mv) / 1000.0f) * ((float)id(bms3_current_ma) / 1000.0f);
+
+          auto now = id(sntp_time).now();
+          uint32_t ts = id(bms3_last_read_epoch) > 0 ? id(bms3_last_read_epoch) : (now.is_valid() ? (uint32_t)now.timestamp : 0);
+          int rssi = id(bms3_rssi);
+          int rssi_quality_pct = rssi <= -100 ? 0 : (rssi >= -50 ? 100 : (2 * (rssi + 100)));
+          const char *rssi_quality = rssi >= -60 ? "excellent" : (rssi >= -70 ? "good" : (rssi >= -80 ? "fair" : (rssi >= -90 ? "weak" : "very_weak")));
+          uint16_t cell_max_mv = id(bms3_cell1_mv);
+          uint16_t cell_min_mv = id(bms3_cell1_mv);
+          if (id(bms3_cell2_mv) > cell_max_mv) cell_max_mv = id(bms3_cell2_mv);
+          if (id(bms3_cell3_mv) > cell_max_mv) cell_max_mv = id(bms3_cell3_mv);
+          if (id(bms3_cell4_mv) > cell_max_mv) cell_max_mv = id(bms3_cell4_mv);
+          if (id(bms3_cell2_mv) < cell_min_mv) cell_min_mv = id(bms3_cell2_mv);
+          if (id(bms3_cell3_mv) < cell_min_mv) cell_min_mv = id(bms3_cell3_mv);
+          if (id(bms3_cell4_mv) < cell_min_mv) cell_min_mv = id(bms3_cell4_mv);
+          uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
+          const char *cell_delta_status = cell_delta_mv <= 10 ? "excellent" : (cell_delta_mv <= 25 ? "good" : (cell_delta_mv <= 40 ? "normal" : (cell_delta_mv <= 60 ? "warning" : "critical")));
+          const char *cell_voltage_status = cell_min_mv < 2900 ? "critical_low" : (cell_min_mv < 3050 ? "low" : (cell_min_mv < 3500 ? "normal" : "high"));
+          const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
+          auto publish_value = [&](const std::string &field, const std::string &value) {
+            id(mqtt_client).publish(base_topic + field, value, 0, false);
+          };
+
+          publish_value("timestamp", esphome::to_string(ts));
+          publish_value("ble_name", ble_name);
+          publish_value("ble_mac", ble_mac);
+          publish_value("rssi", esphome::to_string(rssi));
+          publish_value("rssi_quality_pct", esphome::to_string(rssi_quality_pct));
+          publish_value("rssi_quality", rssi_quality);
+          publish_value("voltage_mv", esphome::to_string(id(bms3_voltage_mv)));
+          publish_value("current_ma", esphome::to_string(id(bms3_current_ma)));
+          publish_value("power_w", esphome::str_sprintf("%.3f", power_w));
+          publish_value("pack_voltage_mv", esphome::to_string(id(bms3_pack_voltage_mv)));
+          publish_value("remain_ah", esphome::to_string(id(bms3_remain_ah)));
+          publish_value("factory_ah", esphome::to_string(id(bms3_factory_ah)));
+          publish_value("cell_temp", esphome::to_string((int)id(bms3_cell_temp)));
+          publish_value("mosfet_temp", esphome::to_string((int)id(bms3_mosfet_temp)));
+          publish_value("soc", esphome::to_string(id(bms3_soc)));
+          publish_value("soh", esphome::to_string(id(bms3_soh)));
+          publish_value("cell1_mv", esphome::to_string(id(bms3_cell1_mv)));
+          publish_value("cell2_mv", esphome::to_string(id(bms3_cell2_mv)));
+          publish_value("cell3_mv", esphome::to_string(id(bms3_cell3_mv)));
+          publish_value("cell4_mv", esphome::to_string(id(bms3_cell4_mv)));
+          publish_value("cell_min_mv", esphome::to_string(cell_min_mv));
+          publish_value("cell_max_mv", esphome::to_string(cell_max_mv));
+          publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
+          publish_value("cell_delta_status", cell_delta_status);
+          publish_value("cell_voltage_status", cell_voltage_status);
+          publish_value("equil_state", esphome::to_string(id(bms3_equil_state)));
+          std::string bms3_equil_cell;
+          uint8_t bms3_eq = id(bms3_equil_state);
+          if (bms3_eq & 0x01) bms3_equil_cell += (bms3_equil_cell.empty() ? "" : ",") + std::string("cell1");
+          if (bms3_eq & 0x02) bms3_equil_cell += (bms3_equil_cell.empty() ? "" : ",") + std::string("cell2");
+          if (bms3_eq & 0x04) bms3_equil_cell += (bms3_equil_cell.empty() ? "" : ",") + std::string("cell3");
+          if (bms3_eq & 0x08) bms3_equil_cell += (bms3_equil_cell.empty() ? "" : ",") + std::string("cell4");
+          publish_value("equil_cell", bms3_equil_cell.empty() ? "none" : bms3_equil_cell);
+          publish_value("protect_state", esphome::to_string(id(bms3_protect_state)));
+          publish_value("discharge_switch", id(bms3_discharge_off) ? "OFF" : "ON");
+          const char *bms3_operating_mode = id(bms3_operating_mode_raw) == 0 ? "idle" : (id(bms3_operating_mode_raw) == 1 ? "charge" : (id(bms3_operating_mode_raw) == 2 ? "discharge" : "unknown"));
+          publish_value("operating_mode_raw", esphome::to_string(id(bms3_operating_mode_raw)));
+          publish_value("operating_mode", bms3_operating_mode);
+          if (id(bms3_discharge_off)) {
+            publish_value("voltage_context", "discharge_off_terminal_voltage_may_drop");
+          } else {
+            publish_value("voltage_context", "normal_output_or_charge_path_voltage");
+          }
+          publish_value("cycle_count", esphome::to_string(id(bms3_cycle_count)));
+          publish_value("discharge_ah_count", esphome::to_string(id(bms3_discharge_ah_count)));
+          if (std::string("${debug_status_flags_hex}") == "true") {
+            publish_value("status_flags_hex", esphome::str_sprintf("0x%08X", (unsigned int)id(bms3_status_flags)));
+          }
+          if (std::string("${publish_raw_frame_hex}") == "true" && !id(bms3_last_frame_hex).empty()) {
+            id(mqtt_client).publish(base_topic + "raw_frame_hex", id(bms3_last_frame_hex), 0, false);
+          }
+
+  - id: publish_bms4
+    then:
+      - lambda: |-
+          if (id(bms4_voltage_mv) == 0) {
+            return;
+          }
+
+          id(publish_ha_discovery_if_needed).execute();
+
+          std::string ble_name = "${bms4_name}";
+          std::string ble_mac = !std::string("${bms4_mac}").empty() ? std::string("${bms4_mac}") : id(bms4_bound_mac);
+          float power_w = ((float)id(bms4_voltage_mv) / 1000.0f) * ((float)id(bms4_current_ma) / 1000.0f);
+
+          auto now = id(sntp_time).now();
+          uint32_t ts = id(bms4_last_read_epoch) > 0 ? id(bms4_last_read_epoch) : (now.is_valid() ? (uint32_t)now.timestamp : 0);
+          int rssi = id(bms4_rssi);
+          int rssi_quality_pct = rssi <= -100 ? 0 : (rssi >= -50 ? 100 : (2 * (rssi + 100)));
+          const char *rssi_quality = rssi >= -60 ? "excellent" : (rssi >= -70 ? "good" : (rssi >= -80 ? "fair" : (rssi >= -90 ? "weak" : "very_weak")));
+          uint16_t cell_max_mv = id(bms4_cell1_mv);
+          uint16_t cell_min_mv = id(bms4_cell1_mv);
+          if (id(bms4_cell2_mv) > cell_max_mv) cell_max_mv = id(bms4_cell2_mv);
+          if (id(bms4_cell3_mv) > cell_max_mv) cell_max_mv = id(bms4_cell3_mv);
+          if (id(bms4_cell4_mv) > cell_max_mv) cell_max_mv = id(bms4_cell4_mv);
+          if (id(bms4_cell2_mv) < cell_min_mv) cell_min_mv = id(bms4_cell2_mv);
+          if (id(bms4_cell3_mv) < cell_min_mv) cell_min_mv = id(bms4_cell3_mv);
+          if (id(bms4_cell4_mv) < cell_min_mv) cell_min_mv = id(bms4_cell4_mv);
+          uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
+          const char *cell_delta_status = cell_delta_mv <= 10 ? "excellent" : (cell_delta_mv <= 25 ? "good" : (cell_delta_mv <= 40 ? "normal" : (cell_delta_mv <= 60 ? "warning" : "critical")));
+          const char *cell_voltage_status = cell_min_mv < 2900 ? "critical_low" : (cell_min_mv < 3050 ? "low" : (cell_min_mv < 3500 ? "normal" : "high"));
+          const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
+          auto publish_value = [&](const std::string &field, const std::string &value) {
+            id(mqtt_client).publish(base_topic + field, value, 0, false);
+          };
+
+          publish_value("timestamp", esphome::to_string(ts));
+          publish_value("ble_name", ble_name);
+          publish_value("ble_mac", ble_mac);
+          publish_value("rssi", esphome::to_string(rssi));
+          publish_value("rssi_quality_pct", esphome::to_string(rssi_quality_pct));
+          publish_value("rssi_quality", rssi_quality);
+          publish_value("voltage_mv", esphome::to_string(id(bms4_voltage_mv)));
+          publish_value("current_ma", esphome::to_string(id(bms4_current_ma)));
+          publish_value("power_w", esphome::str_sprintf("%.3f", power_w));
+          publish_value("pack_voltage_mv", esphome::to_string(id(bms4_pack_voltage_mv)));
+          publish_value("remain_ah", esphome::to_string(id(bms4_remain_ah)));
+          publish_value("factory_ah", esphome::to_string(id(bms4_factory_ah)));
+          publish_value("cell_temp", esphome::to_string((int)id(bms4_cell_temp)));
+          publish_value("mosfet_temp", esphome::to_string((int)id(bms4_mosfet_temp)));
+          publish_value("soc", esphome::to_string(id(bms4_soc)));
+          publish_value("soh", esphome::to_string(id(bms4_soh)));
+          publish_value("cell1_mv", esphome::to_string(id(bms4_cell1_mv)));
+          publish_value("cell2_mv", esphome::to_string(id(bms4_cell2_mv)));
+          publish_value("cell3_mv", esphome::to_string(id(bms4_cell3_mv)));
+          publish_value("cell4_mv", esphome::to_string(id(bms4_cell4_mv)));
+          publish_value("cell_min_mv", esphome::to_string(cell_min_mv));
+          publish_value("cell_max_mv", esphome::to_string(cell_max_mv));
+          publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
+          publish_value("cell_delta_status", cell_delta_status);
+          publish_value("cell_voltage_status", cell_voltage_status);
+          publish_value("equil_state", esphome::to_string(id(bms4_equil_state)));
+          std::string bms4_equil_cell;
+          uint8_t bms4_eq = id(bms4_equil_state);
+          if (bms4_eq & 0x01) bms4_equil_cell += (bms4_equil_cell.empty() ? "" : ",") + std::string("cell1");
+          if (bms4_eq & 0x02) bms4_equil_cell += (bms4_equil_cell.empty() ? "" : ",") + std::string("cell2");
+          if (bms4_eq & 0x04) bms4_equil_cell += (bms4_equil_cell.empty() ? "" : ",") + std::string("cell3");
+          if (bms4_eq & 0x08) bms4_equil_cell += (bms4_equil_cell.empty() ? "" : ",") + std::string("cell4");
+          publish_value("equil_cell", bms4_equil_cell.empty() ? "none" : bms4_equil_cell);
+          publish_value("protect_state", esphome::to_string(id(bms4_protect_state)));
+          publish_value("discharge_switch", id(bms4_discharge_off) ? "OFF" : "ON");
+          const char *bms4_operating_mode = id(bms4_operating_mode_raw) == 0 ? "idle" : (id(bms4_operating_mode_raw) == 1 ? "charge" : (id(bms4_operating_mode_raw) == 2 ? "discharge" : "unknown"));
+          publish_value("operating_mode_raw", esphome::to_string(id(bms4_operating_mode_raw)));
+          publish_value("operating_mode", bms4_operating_mode);
+          if (id(bms4_discharge_off)) {
+            publish_value("voltage_context", "discharge_off_terminal_voltage_may_drop");
+          } else {
+            publish_value("voltage_context", "normal_output_or_charge_path_voltage");
+          }
+          publish_value("cycle_count", esphome::to_string(id(bms4_cycle_count)));
+          publish_value("discharge_ah_count", esphome::to_string(id(bms4_discharge_ah_count)));
+          if (std::string("${debug_status_flags_hex}") == "true") {
+            publish_value("status_flags_hex", esphome::str_sprintf("0x%08X", (unsigned int)id(bms4_status_flags)));
+          }
+          if (std::string("${publish_raw_frame_hex}") == "true" && !id(bms4_last_frame_hex).empty()) {
+            id(mqtt_client).publish(base_topic + "raw_frame_hex", id(bms4_last_frame_hex), 0, false);
+          }
+
+  - id: publish_bms5
+    then:
+      - lambda: |-
+          if (id(bms5_voltage_mv) == 0) {
+            return;
+          }
+
+          id(publish_ha_discovery_if_needed).execute();
+
+          std::string ble_name = "${bms5_name}";
+          std::string ble_mac = !std::string("${bms5_mac}").empty() ? std::string("${bms5_mac}") : id(bms5_bound_mac);
+          float power_w = ((float)id(bms5_voltage_mv) / 1000.0f) * ((float)id(bms5_current_ma) / 1000.0f);
+
+          auto now = id(sntp_time).now();
+          uint32_t ts = id(bms5_last_read_epoch) > 0 ? id(bms5_last_read_epoch) : (now.is_valid() ? (uint32_t)now.timestamp : 0);
+          int rssi = id(bms5_rssi);
+          int rssi_quality_pct = rssi <= -100 ? 0 : (rssi >= -50 ? 100 : (2 * (rssi + 100)));
+          const char *rssi_quality = rssi >= -60 ? "excellent" : (rssi >= -70 ? "good" : (rssi >= -80 ? "fair" : (rssi >= -90 ? "weak" : "very_weak")));
+          uint16_t cell_max_mv = id(bms5_cell1_mv);
+          uint16_t cell_min_mv = id(bms5_cell1_mv);
+          if (id(bms5_cell2_mv) > cell_max_mv) cell_max_mv = id(bms5_cell2_mv);
+          if (id(bms5_cell3_mv) > cell_max_mv) cell_max_mv = id(bms5_cell3_mv);
+          if (id(bms5_cell4_mv) > cell_max_mv) cell_max_mv = id(bms5_cell4_mv);
+          if (id(bms5_cell2_mv) < cell_min_mv) cell_min_mv = id(bms5_cell2_mv);
+          if (id(bms5_cell3_mv) < cell_min_mv) cell_min_mv = id(bms5_cell3_mv);
+          if (id(bms5_cell4_mv) < cell_min_mv) cell_min_mv = id(bms5_cell4_mv);
+          uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
+          const char *cell_delta_status = cell_delta_mv <= 10 ? "excellent" : (cell_delta_mv <= 25 ? "good" : (cell_delta_mv <= 40 ? "normal" : (cell_delta_mv <= 60 ? "warning" : "critical")));
+          const char *cell_voltage_status = cell_min_mv < 2900 ? "critical_low" : (cell_min_mv < 3050 ? "low" : (cell_min_mv < 3500 ? "normal" : "high"));
+          const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
+          auto publish_value = [&](const std::string &field, const std::string &value) {
+            id(mqtt_client).publish(base_topic + field, value, 0, false);
+          };
+
+          publish_value("timestamp", esphome::to_string(ts));
+          publish_value("ble_name", ble_name);
+          publish_value("ble_mac", ble_mac);
+          publish_value("rssi", esphome::to_string(rssi));
+          publish_value("rssi_quality_pct", esphome::to_string(rssi_quality_pct));
+          publish_value("rssi_quality", rssi_quality);
+          publish_value("voltage_mv", esphome::to_string(id(bms5_voltage_mv)));
+          publish_value("current_ma", esphome::to_string(id(bms5_current_ma)));
+          publish_value("power_w", esphome::str_sprintf("%.3f", power_w));
+          publish_value("pack_voltage_mv", esphome::to_string(id(bms5_pack_voltage_mv)));
+          publish_value("remain_ah", esphome::to_string(id(bms5_remain_ah)));
+          publish_value("factory_ah", esphome::to_string(id(bms5_factory_ah)));
+          publish_value("cell_temp", esphome::to_string((int)id(bms5_cell_temp)));
+          publish_value("mosfet_temp", esphome::to_string((int)id(bms5_mosfet_temp)));
+          publish_value("soc", esphome::to_string(id(bms5_soc)));
+          publish_value("soh", esphome::to_string(id(bms5_soh)));
+          publish_value("cell1_mv", esphome::to_string(id(bms5_cell1_mv)));
+          publish_value("cell2_mv", esphome::to_string(id(bms5_cell2_mv)));
+          publish_value("cell3_mv", esphome::to_string(id(bms5_cell3_mv)));
+          publish_value("cell4_mv", esphome::to_string(id(bms5_cell4_mv)));
+          publish_value("cell_min_mv", esphome::to_string(cell_min_mv));
+          publish_value("cell_max_mv", esphome::to_string(cell_max_mv));
+          publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
+          publish_value("cell_delta_status", cell_delta_status);
+          publish_value("cell_voltage_status", cell_voltage_status);
+          publish_value("equil_state", esphome::to_string(id(bms5_equil_state)));
+          std::string bms5_equil_cell;
+          uint8_t bms5_eq = id(bms5_equil_state);
+          if (bms5_eq & 0x01) bms5_equil_cell += (bms5_equil_cell.empty() ? "" : ",") + std::string("cell1");
+          if (bms5_eq & 0x02) bms5_equil_cell += (bms5_equil_cell.empty() ? "" : ",") + std::string("cell2");
+          if (bms5_eq & 0x04) bms5_equil_cell += (bms5_equil_cell.empty() ? "" : ",") + std::string("cell3");
+          if (bms5_eq & 0x08) bms5_equil_cell += (bms5_equil_cell.empty() ? "" : ",") + std::string("cell4");
+          publish_value("equil_cell", bms5_equil_cell.empty() ? "none" : bms5_equil_cell);
+          publish_value("protect_state", esphome::to_string(id(bms5_protect_state)));
+          publish_value("discharge_switch", id(bms5_discharge_off) ? "OFF" : "ON");
+          const char *bms5_operating_mode = id(bms5_operating_mode_raw) == 0 ? "idle" : (id(bms5_operating_mode_raw) == 1 ? "charge" : (id(bms5_operating_mode_raw) == 2 ? "discharge" : "unknown"));
+          publish_value("operating_mode_raw", esphome::to_string(id(bms5_operating_mode_raw)));
+          publish_value("operating_mode", bms5_operating_mode);
+          if (id(bms5_discharge_off)) {
+            publish_value("voltage_context", "discharge_off_terminal_voltage_may_drop");
+          } else {
+            publish_value("voltage_context", "normal_output_or_charge_path_voltage");
+          }
+          publish_value("cycle_count", esphome::to_string(id(bms5_cycle_count)));
+          publish_value("discharge_ah_count", esphome::to_string(id(bms5_discharge_ah_count)));
+          if (std::string("${debug_status_flags_hex}") == "true") {
+            publish_value("status_flags_hex", esphome::str_sprintf("0x%08X", (unsigned int)id(bms5_status_flags)));
+          }
+          if (std::string("${publish_raw_frame_hex}") == "true" && !id(bms5_last_frame_hex).empty()) {
+            id(mqtt_client).publish(base_topic + "raw_frame_hex", id(bms5_last_frame_hex), 0, false);
+          }
+
+  - id: publish_bms6
+    then:
+      - lambda: |-
+          if (id(bms6_voltage_mv) == 0) {
+            return;
+          }
+
+          id(publish_ha_discovery_if_needed).execute();
+
+          std::string ble_name = "${bms6_name}";
+          std::string ble_mac = !std::string("${bms6_mac}").empty() ? std::string("${bms6_mac}") : id(bms6_bound_mac);
+          float power_w = ((float)id(bms6_voltage_mv) / 1000.0f) * ((float)id(bms6_current_ma) / 1000.0f);
+
+          auto now = id(sntp_time).now();
+          uint32_t ts = id(bms6_last_read_epoch) > 0 ? id(bms6_last_read_epoch) : (now.is_valid() ? (uint32_t)now.timestamp : 0);
+          int rssi = id(bms6_rssi);
+          int rssi_quality_pct = rssi <= -100 ? 0 : (rssi >= -50 ? 100 : (2 * (rssi + 100)));
+          const char *rssi_quality = rssi >= -60 ? "excellent" : (rssi >= -70 ? "good" : (rssi >= -80 ? "fair" : (rssi >= -90 ? "weak" : "very_weak")));
+          uint16_t cell_max_mv = id(bms6_cell1_mv);
+          uint16_t cell_min_mv = id(bms6_cell1_mv);
+          if (id(bms6_cell2_mv) > cell_max_mv) cell_max_mv = id(bms6_cell2_mv);
+          if (id(bms6_cell3_mv) > cell_max_mv) cell_max_mv = id(bms6_cell3_mv);
+          if (id(bms6_cell4_mv) > cell_max_mv) cell_max_mv = id(bms6_cell4_mv);
+          if (id(bms6_cell2_mv) < cell_min_mv) cell_min_mv = id(bms6_cell2_mv);
+          if (id(bms6_cell3_mv) < cell_min_mv) cell_min_mv = id(bms6_cell3_mv);
+          if (id(bms6_cell4_mv) < cell_min_mv) cell_min_mv = id(bms6_cell4_mv);
+          uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
+          const char *cell_delta_status = cell_delta_mv <= 10 ? "excellent" : (cell_delta_mv <= 25 ? "good" : (cell_delta_mv <= 40 ? "normal" : (cell_delta_mv <= 60 ? "warning" : "critical")));
+          const char *cell_voltage_status = cell_min_mv < 2900 ? "critical_low" : (cell_min_mv < 3050 ? "low" : (cell_min_mv < 3500 ? "normal" : "high"));
+          const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
+          auto publish_value = [&](const std::string &field, const std::string &value) {
+            id(mqtt_client).publish(base_topic + field, value, 0, false);
+          };
+
+          publish_value("timestamp", esphome::to_string(ts));
+          publish_value("ble_name", ble_name);
+          publish_value("ble_mac", ble_mac);
+          publish_value("rssi", esphome::to_string(rssi));
+          publish_value("rssi_quality_pct", esphome::to_string(rssi_quality_pct));
+          publish_value("rssi_quality", rssi_quality);
+          publish_value("voltage_mv", esphome::to_string(id(bms6_voltage_mv)));
+          publish_value("current_ma", esphome::to_string(id(bms6_current_ma)));
+          publish_value("power_w", esphome::str_sprintf("%.3f", power_w));
+          publish_value("pack_voltage_mv", esphome::to_string(id(bms6_pack_voltage_mv)));
+          publish_value("remain_ah", esphome::to_string(id(bms6_remain_ah)));
+          publish_value("factory_ah", esphome::to_string(id(bms6_factory_ah)));
+          publish_value("cell_temp", esphome::to_string((int)id(bms6_cell_temp)));
+          publish_value("mosfet_temp", esphome::to_string((int)id(bms6_mosfet_temp)));
+          publish_value("soc", esphome::to_string(id(bms6_soc)));
+          publish_value("soh", esphome::to_string(id(bms6_soh)));
+          publish_value("cell1_mv", esphome::to_string(id(bms6_cell1_mv)));
+          publish_value("cell2_mv", esphome::to_string(id(bms6_cell2_mv)));
+          publish_value("cell3_mv", esphome::to_string(id(bms6_cell3_mv)));
+          publish_value("cell4_mv", esphome::to_string(id(bms6_cell4_mv)));
+          publish_value("cell_min_mv", esphome::to_string(cell_min_mv));
+          publish_value("cell_max_mv", esphome::to_string(cell_max_mv));
+          publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
+          publish_value("cell_delta_status", cell_delta_status);
+          publish_value("cell_voltage_status", cell_voltage_status);
+          publish_value("equil_state", esphome::to_string(id(bms6_equil_state)));
+          std::string bms6_equil_cell;
+          uint8_t bms6_eq = id(bms6_equil_state);
+          if (bms6_eq & 0x01) bms6_equil_cell += (bms6_equil_cell.empty() ? "" : ",") + std::string("cell1");
+          if (bms6_eq & 0x02) bms6_equil_cell += (bms6_equil_cell.empty() ? "" : ",") + std::string("cell2");
+          if (bms6_eq & 0x04) bms6_equil_cell += (bms6_equil_cell.empty() ? "" : ",") + std::string("cell3");
+          if (bms6_eq & 0x08) bms6_equil_cell += (bms6_equil_cell.empty() ? "" : ",") + std::string("cell4");
+          publish_value("equil_cell", bms6_equil_cell.empty() ? "none" : bms6_equil_cell);
+          publish_value("protect_state", esphome::to_string(id(bms6_protect_state)));
+          publish_value("discharge_switch", id(bms6_discharge_off) ? "OFF" : "ON");
+          const char *bms6_operating_mode = id(bms6_operating_mode_raw) == 0 ? "idle" : (id(bms6_operating_mode_raw) == 1 ? "charge" : (id(bms6_operating_mode_raw) == 2 ? "discharge" : "unknown"));
+          publish_value("operating_mode_raw", esphome::to_string(id(bms6_operating_mode_raw)));
+          publish_value("operating_mode", bms6_operating_mode);
+          if (id(bms6_discharge_off)) {
+            publish_value("voltage_context", "discharge_off_terminal_voltage_may_drop");
+          } else {
+            publish_value("voltage_context", "normal_output_or_charge_path_voltage");
+          }
+          publish_value("cycle_count", esphome::to_string(id(bms6_cycle_count)));
+          publish_value("discharge_ah_count", esphome::to_string(id(bms6_discharge_ah_count)));
+          if (std::string("${debug_status_flags_hex}") == "true") {
+            publish_value("status_flags_hex", esphome::str_sprintf("0x%08X", (unsigned int)id(bms6_status_flags)));
+          }
+          if (std::string("${publish_raw_frame_hex}") == "true" && !id(bms6_last_frame_hex).empty()) {
+            id(mqtt_client).publish(base_topic + "raw_frame_hex", id(bms6_last_frame_hex), 0, false);
+          }
+
+  # ===== SYSTEM AGGREGATION =====
+  - id: publish_system_aggregate
+    then:
+      - lambda: |-
+          const std::string topology = "${battery_system_topology}";
+          const std::string system_name = "${battery_system_name}";
+
+          struct GroupAgg {
+            std::vector<int> slots;
+            float voltage_mv = 0.0f;
+            float current_ma = 0.0f;
+            float capacity_ah = 0.0f;
+            float remain_ah = 0.0f;
+            int contributing = 0;
+          };
+
+          auto slot_enabled = [&](int slot) -> bool {
+            switch (slot) {
+              case 1: return std::string("${bms1_enabled}") == "true";
+              case 2: return std::string("${bms2_enabled}") == "true";
+              case 3: return std::string("${bms3_enabled}") == "true";
+              case 4: return std::string("${bms4_enabled}") == "true";
+              case 5: return std::string("${bms5_enabled}") == "true";
+              case 6: return std::string("${bms6_enabled}") == "true";
+              default: return false;
+            }
+          };
+
+          auto slot_voltage_mv = [&](int slot) -> uint16_t {
+            switch (slot) {
+              case 1: return id(bms1_voltage_mv);
+              case 2: return id(bms2_voltage_mv);
+              case 3: return id(bms3_voltage_mv);
+              case 4: return id(bms4_voltage_mv);
+              case 5: return id(bms5_voltage_mv);
+              case 6: return id(bms6_voltage_mv);
+              default: return 0;
+            }
+          };
+
+          auto slot_current_ma = [&](int slot) -> int16_t {
+            switch (slot) {
+              case 1: return id(bms1_current_ma);
+              case 2: return id(bms2_current_ma);
+              case 3: return id(bms3_current_ma);
+              case 4: return id(bms4_current_ma);
+              case 5: return id(bms5_current_ma);
+              case 6: return id(bms6_current_ma);
+              default: return 0;
+            }
+          };
+
+          auto slot_capacity_ah = [&](int slot) -> float {
+            switch (slot) {
+              case 1: return (float)id(bms1_factory_ah);
+              case 2: return (float)id(bms2_factory_ah);
+              case 3: return (float)id(bms3_factory_ah);
+              case 4: return (float)id(bms4_factory_ah);
+              case 5: return (float)id(bms5_factory_ah);
+              case 6: return (float)id(bms6_factory_ah);
+              default: return 0.0f;
+            }
+          };
+
+          auto slot_remain_ah = [&](int slot) -> float {
+            switch (slot) {
+              case 1: return (float)id(bms1_remain_ah);
+              case 2: return (float)id(bms2_remain_ah);
+              case 3: return (float)id(bms3_remain_ah);
+              case 4: return (float)id(bms4_remain_ah);
+              case 5: return (float)id(bms5_remain_ah);
+              case 6: return (float)id(bms6_remain_ah);
+              default: return 0.0f;
+            }
+          };
+
+          auto slot_rssi = [&](int slot) -> int16_t {
+            switch (slot) {
+              case 1: return id(bms1_rssi);
+              case 2: return id(bms2_rssi);
+              case 3: return id(bms3_rssi);
+              case 4: return id(bms4_rssi);
+              case 5: return id(bms5_rssi);
+              case 6: return id(bms6_rssi);
+              default: return -127;
+            }
+          };
+
+          auto slot_cell_delta_mv = [&](int slot) -> uint16_t {
+            uint16_t c1 = 0;
+            uint16_t c2 = 0;
+            uint16_t c3 = 0;
+            uint16_t c4 = 0;
+            switch (slot) {
+              case 1: c1 = id(bms1_cell1_mv); c2 = id(bms1_cell2_mv); c3 = id(bms1_cell3_mv); c4 = id(bms1_cell4_mv); break;
+              case 2: c1 = id(bms2_cell1_mv); c2 = id(bms2_cell2_mv); c3 = id(bms2_cell3_mv); c4 = id(bms2_cell4_mv); break;
+              case 3: c1 = id(bms3_cell1_mv); c2 = id(bms3_cell2_mv); c3 = id(bms3_cell3_mv); c4 = id(bms3_cell4_mv); break;
+              case 4: c1 = id(bms4_cell1_mv); c2 = id(bms4_cell2_mv); c3 = id(bms4_cell3_mv); c4 = id(bms4_cell4_mv); break;
+              case 5: c1 = id(bms5_cell1_mv); c2 = id(bms5_cell2_mv); c3 = id(bms5_cell3_mv); c4 = id(bms5_cell4_mv); break;
+              case 6: c1 = id(bms6_cell1_mv); c2 = id(bms6_cell2_mv); c3 = id(bms6_cell3_mv); c4 = id(bms6_cell4_mv); break;
+              default: return 0;
+            }
+
+            uint16_t vmax = c1;
+            uint16_t vmin = c1;
+            if (c2 > vmax) vmax = c2;
+            if (c3 > vmax) vmax = c3;
+            if (c4 > vmax) vmax = c4;
+            if (c2 < vmin) vmin = c2;
+            if (c3 < vmin) vmin = c3;
+            if (c4 < vmin) vmin = c4;
+            return vmax - vmin;
+          };
+
+          auto slot_cell_min_mv = [&](int slot) -> uint16_t {
+            uint16_t c1 = 0, c2 = 0, c3 = 0, c4 = 0;
+            switch (slot) {
+              case 1: c1 = id(bms1_cell1_mv); c2 = id(bms1_cell2_mv); c3 = id(bms1_cell3_mv); c4 = id(bms1_cell4_mv); break;
+              case 2: c1 = id(bms2_cell1_mv); c2 = id(bms2_cell2_mv); c3 = id(bms2_cell3_mv); c4 = id(bms2_cell4_mv); break;
+              case 3: c1 = id(bms3_cell1_mv); c2 = id(bms3_cell2_mv); c3 = id(bms3_cell3_mv); c4 = id(bms3_cell4_mv); break;
+              case 4: c1 = id(bms4_cell1_mv); c2 = id(bms4_cell2_mv); c3 = id(bms4_cell3_mv); c4 = id(bms4_cell4_mv); break;
+              case 5: c1 = id(bms5_cell1_mv); c2 = id(bms5_cell2_mv); c3 = id(bms5_cell3_mv); c4 = id(bms5_cell4_mv); break;
+              case 6: c1 = id(bms6_cell1_mv); c2 = id(bms6_cell2_mv); c3 = id(bms6_cell3_mv); c4 = id(bms6_cell4_mv); break;
+              default: return 0;
+            }
+            if (c1 == 0) return 0;
+            uint16_t vmin = c1;
+            if (c2 && c2 < vmin) vmin = c2;
+            if (c3 && c3 < vmin) vmin = c3;
+            if (c4 && c4 < vmin) vmin = c4;
+            return vmin;
+          };
+
+          auto slot_cell_temp_c = [&](int slot) -> int16_t {
+            switch (slot) {
+              case 1: return id(bms1_cell_temp);
+              case 2: return id(bms2_cell_temp);
+              case 3: return id(bms3_cell_temp);
+              case 4: return id(bms4_cell_temp);
+              case 5: return id(bms5_cell_temp);
+              case 6: return id(bms6_cell_temp);
+              default: return 0;
+            }
+          };
+
+          auto slot_mosfet_temp_c = [&](int slot) -> int16_t {
+            switch (slot) {
+              case 1: return id(bms1_mosfet_temp);
+              case 2: return id(bms2_mosfet_temp);
+              case 3: return id(bms3_mosfet_temp);
+              case 4: return id(bms4_mosfet_temp);
+              case 5: return id(bms5_mosfet_temp);
+              case 6: return id(bms6_mosfet_temp);
+              default: return 0;
+            }
+          };
+
+          auto slot_cycle_count = [&](int slot) -> uint32_t {
+            switch (slot) {
+              case 1: return id(bms1_cycle_count);
+              case 2: return id(bms2_cycle_count);
+              case 3: return id(bms3_cycle_count);
+              case 4: return id(bms4_cycle_count);
+              case 5: return id(bms5_cycle_count);
+              case 6: return id(bms6_cycle_count);
+              default: return 0;
+            }
+          };
+
+          auto slot_discharge_ah_count = [&](int slot) -> uint32_t {
+            switch (slot) {
+              case 1: return id(bms1_discharge_ah_count);
+              case 2: return id(bms2_discharge_ah_count);
+              case 3: return id(bms3_discharge_ah_count);
+              case 4: return id(bms4_discharge_ah_count);
+              case 5: return id(bms5_discharge_ah_count);
+              case 6: return id(bms6_discharge_ah_count);
+              default: return 0;
+            }
+          };
+
+          std::vector<GroupAgg> groups;
+          GroupAgg current_group;
+          bool used_slot[7] = {false, false, false, false, false, false, false};
+
+          for (char c : topology) {
+            if (c == '-' || c == ' ') {
+              if (!current_group.slots.empty()) {
+                groups.push_back(current_group);
+                current_group = GroupAgg();
+              }
+              continue;
+            }
+
+            if (c >= '1' && c <= '6') {
+              int slot = (int)(c - '0');
+              if (!used_slot[slot]) {
+                used_slot[slot] = true;
+                current_group.slots.push_back(slot);
+              }
+            }
+          }
+          if (!current_group.slots.empty()) {
+            groups.push_back(current_group);
+          }
+
+          int expected_slots = 0;
+          for (int slot = 1; slot <= 6; slot++) {
+            if (used_slot[slot]) {
+              expected_slots++;
+            }
+          }
+
+          bool topology_valid = !groups.empty();
+          int active_slots = 0;
+          int16_t pack_rssi_weakest_dbm = 0;
+          bool pack_rssi_init = false;
+          float slots_vmax_mv = 0.0f;
+          float slots_vmin_mv = 0.0f;
+          bool slots_v_init = false;
+          float pack_cell_delta_max_mv = 0.0f;
+          uint16_t pack_cell_min_mv = 0;
+          bool pack_cell_min_init = false;
+          uint32_t pack_cycle_count_max = 0;
+          uint64_t pack_discharged_ah_total = 0;
+          int pack_cell_temp_min_c = 0;
+          int pack_cell_temp_max_c = 0;
+          int pack_mosfet_temp_min_c = 0;
+          int pack_mosfet_temp_max_c = 0;
+          bool pack_temp_init = false;
+
+          for (auto &g : groups) {
+            float group_voltage_sum = 0.0f;
+            int group_voltage_count = 0;
+            float group_current_sum = 0.0f;
+            float group_capacity_sum = 0.0f;
+            float group_remain_sum = 0.0f;
+
+            for (int slot : g.slots) {
+              if (!slot_enabled(slot)) {
+                continue;
+              }
+
+              uint16_t vmv = slot_voltage_mv(slot);
+              float cah = slot_capacity_ah(slot);
+              if (vmv == 0 || cah <= 0.0f) {
+                continue;
+              }
+
+              active_slots++;
+              group_voltage_sum += (float)vmv;
+              group_voltage_count++;
+              group_current_sum += (float)slot_current_ma(slot);
+              group_capacity_sum += cah;
+              group_remain_sum += slot_remain_ah(slot);
+
+              if (!pack_rssi_init) {
+                pack_rssi_weakest_dbm = slot_rssi(slot);
+                pack_rssi_init = true;
+              } else if (slot_rssi(slot) < pack_rssi_weakest_dbm) {
+                pack_rssi_weakest_dbm = slot_rssi(slot);
+              }
+
+              if (!slots_v_init) {
+                slots_vmax_mv = (float)vmv;
+                slots_vmin_mv = (float)vmv;
+                slots_v_init = true;
+              } else {
+                if ((float)vmv > slots_vmax_mv) slots_vmax_mv = (float)vmv;
+                if ((float)vmv < slots_vmin_mv) slots_vmin_mv = (float)vmv;
+              }
+
+              float slot_delta = (float)slot_cell_delta_mv(slot);
+              if (slot_delta > pack_cell_delta_max_mv) {
+                pack_cell_delta_max_mv = slot_delta;
+              }
+
+              uint16_t slot_cmin = slot_cell_min_mv(slot);
+              if (slot_cmin > 0 && (!pack_cell_min_init || slot_cmin < pack_cell_min_mv)) {
+                pack_cell_min_mv = slot_cmin;
+                pack_cell_min_init = true;
+              }
+
+              uint32_t slot_cycles = slot_cycle_count(slot);
+              if (slot_cycles > pack_cycle_count_max) {
+                pack_cycle_count_max = slot_cycles;
+              }
+              pack_discharged_ah_total += (uint64_t) slot_discharge_ah_count(slot);
+
+              int cell_t = (int)slot_cell_temp_c(slot);
+              int mos_t = (int)slot_mosfet_temp_c(slot);
+              if (!pack_temp_init) {
+                pack_cell_temp_min_c = cell_t;
+                pack_cell_temp_max_c = cell_t;
+                pack_mosfet_temp_min_c = mos_t;
+                pack_mosfet_temp_max_c = mos_t;
+                pack_temp_init = true;
+              } else {
+                if (cell_t < pack_cell_temp_min_c) pack_cell_temp_min_c = cell_t;
+                if (cell_t > pack_cell_temp_max_c) pack_cell_temp_max_c = cell_t;
+                if (mos_t < pack_mosfet_temp_min_c) pack_mosfet_temp_min_c = mos_t;
+                if (mos_t > pack_mosfet_temp_max_c) pack_mosfet_temp_max_c = mos_t;
+              }
+            }
+
+            if (group_voltage_count == 0) {
+              topology_valid = false;
+              g.voltage_mv = 0.0f;
+              g.current_ma = 0.0f;
+              g.capacity_ah = 0.0f;
+              g.remain_ah = 0.0f;
+              g.contributing = 0;
+            } else {
+              g.voltage_mv = group_voltage_sum / (float)group_voltage_count;
+              g.current_ma = group_current_sum;
+              g.capacity_ah = group_capacity_sum;
+              g.remain_ah = group_remain_sum;
+              g.contributing = group_voltage_count;
+            }
+          }
+
+          float pack_voltage_mv = 0.0f;
+          float pack_current_ma = 0.0f;
+          float pack_capacity_ah = 0.0f;
+          float pack_remain_ah = 0.0f;
+          float pack_soc = 0.0f;
+          float pack_power_w = 0.0f;
+          float series_group_voltage_delta_mv = 0.0f;
+          float slot_voltage_delta_mv = 0.0f;
+          int valid_groups = 0;
+
+          if (topology_valid) {
+            float current_sum = 0.0f;
+            float min_capacity = 0.0f;
+            float min_remain = 0.0f;
+            bool min_init = false;
+            float group_vmax_mv = 0.0f;
+            float group_vmin_mv = 0.0f;
+            bool group_v_init = false;
+
+            for (auto &g : groups) {
+              if (g.contributing == 0) {
+                topology_valid = false;
+                break;
+              }
+              valid_groups++;
+              pack_voltage_mv += g.voltage_mv;
+              current_sum += g.current_ma;
+
+              if (!group_v_init) {
+                group_vmax_mv = g.voltage_mv;
+                group_vmin_mv = g.voltage_mv;
+                group_v_init = true;
+              } else {
+                if (g.voltage_mv > group_vmax_mv) group_vmax_mv = g.voltage_mv;
+                if (g.voltage_mv < group_vmin_mv) group_vmin_mv = g.voltage_mv;
+              }
+
+              if (!min_init) {
+                min_capacity = g.capacity_ah;
+                min_remain = g.remain_ah;
+                min_init = true;
+              } else if (g.capacity_ah < min_capacity) {
+                min_capacity = g.capacity_ah;
+              }
+
+              if (g.remain_ah < min_remain) {
+                min_remain = g.remain_ah;
+              }
+            }
+
+            if (topology_valid && valid_groups > 0) {
+              pack_current_ma = current_sum / (float)valid_groups;
+              pack_capacity_ah = min_capacity;
+              pack_remain_ah = min_remain;
+              if (pack_capacity_ah > 0.0f) {
+                pack_soc = (pack_remain_ah / pack_capacity_ah) * 100.0f;
+                if (pack_soc < 0.0f) pack_soc = 0.0f;
+                if (pack_soc > 100.0f) pack_soc = 100.0f;
+              }
+              pack_power_w = (pack_voltage_mv / 1000.0f) * (pack_current_ma / 1000.0f);
+              series_group_voltage_delta_mv = group_vmax_mv - group_vmin_mv;
+            }
+          }
+
+          if (slots_v_init) {
+            slot_voltage_delta_mv = slots_vmax_mv - slots_vmin_mv;
+          }
+
+          bool topology_complete = topology_valid && expected_slots > 0 && active_slots == expected_slots;
+
+          int pack_rssi_quality_pct = pack_rssi_weakest_dbm <= -100 ? 0 : (pack_rssi_weakest_dbm >= -50 ? 100 : (2 * (pack_rssi_weakest_dbm + 100)));
+          const char *pack_rssi_quality = pack_rssi_weakest_dbm >= -60 ? "excellent" : (pack_rssi_weakest_dbm >= -70 ? "good" : (pack_rssi_weakest_dbm >= -80 ? "fair" : (pack_rssi_weakest_dbm >= -90 ? "weak" : "very_weak")));
+          auto cell_balancer_level = [&](float delta_mv) -> const char * {
+            if (delta_mv <= 10.0f) return "excellent";
+            if (delta_mv <= 25.0f) return "good";
+            if (delta_mv <= 40.0f) return "normal";
+            if (delta_mv <= 60.0f) return "warning";
+            return "critical";
+          };
+          // HA01 Equalizer works on 12V-pack differences and typically starts balancing around 20 mV.
+          auto pack_series_balancer_level = [&](float delta_mv) -> const char * {
+            if (delta_mv <= 20.0f) return "good";
+            if (delta_mv <= 50.0f) return "light";
+            if (delta_mv <= 120.0f) return "warning";
+            return "critical";
+          };
+          const char *pack_cell_balancer_status = cell_balancer_level(pack_cell_delta_max_mv);
+          const char *pack_series_balancer_status = pack_series_balancer_level(series_group_voltage_delta_mv);
+
+          auto now = id(sntp_time).now();
+          uint32_t ts = now.is_valid() ? (uint32_t) now.timestamp : 0;
+
+          std::string group_parts;
+          for (size_t gi = 0; gi < groups.size(); gi++) {
+            if (gi > 0) {
+              group_parts += ",";
+            }
+
+            std::string slots_json;
+            for (size_t si = 0; si < groups[gi].slots.size(); si++) {
+              if (si > 0) {
+                slots_json += ",";
+              }
+              slots_json += esphome::to_string(groups[gi].slots[si]);
+            }
+
+            group_parts += esphome::str_sprintf(
+              "{\"index\":%u,\"slots\":[%s],\"voltage_mv\":%.0f,\"current_ma\":%.0f,\"capacity_ah\":%.0f,\"contributors\":%d}",
+              (unsigned int) (gi + 1),
+              slots_json.c_str(),
+              groups[gi].voltage_mv,
+              groups[gi].current_ma,
+              groups[gi].capacity_ah,
+              groups[gi].contributing
+            );
+          }
+
+          const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + system_name + "/";
+          auto publish_value = [&](const std::string &field, const std::string &value) {
+            id(mqtt_client).publish(base_topic + field, value, 0, false);
+          };
+
+          publish_value("timestamp", esphome::to_string(ts));
+          publish_value("system_name", system_name);
+          publish_value("topology", topology);
+          publish_value("topology_complete", topology_complete ? "true" : "false");
+          publish_value("series_groups", esphome::to_string((unsigned int)groups.size()));
+          publish_value("active_slots", esphome::to_string(active_slots));
+          publish_value("expected_slots", esphome::to_string(expected_slots));
+          publish_value("topology_reporting", esphome::to_string(active_slots) + "/" + esphome::to_string(expected_slots));
+          publish_value("pack_voltage_mv", esphome::str_sprintf("%.0f", pack_voltage_mv));
+          publish_value("pack_current_ma", esphome::str_sprintf("%.0f", pack_current_ma));
+          publish_value("pack_capacity_ah", esphome::str_sprintf("%.0f", pack_capacity_ah));
+          publish_value("pack_remain_ah", esphome::str_sprintf("%.0f", pack_remain_ah));
+          publish_value("pack_soc", esphome::str_sprintf("%.1f", pack_soc));
+          publish_value("pack_power_w", esphome::str_sprintf("%.3f", pack_power_w));
+          publish_value("pack_rssi_weakest_dbm", esphome::to_string(pack_rssi_weakest_dbm));
+          publish_value("pack_rssi_quality_pct", esphome::to_string(pack_rssi_quality_pct));
+          publish_value("pack_rssi_quality", pack_rssi_quality);
+          publish_value("pack_cell_temp_min_c", esphome::to_string(pack_cell_temp_min_c));
+          publish_value("pack_cell_temp_max_c", esphome::to_string(pack_cell_temp_max_c));
+          publish_value("pack_mosfet_temp_min_c", esphome::to_string(pack_mosfet_temp_min_c));
+          publish_value("pack_mosfet_temp_max_c", esphome::to_string(pack_mosfet_temp_max_c));
+          publish_value("series_group_voltage_delta_mv", esphome::str_sprintf("%.0f", series_group_voltage_delta_mv));
+          publish_value("slot_voltage_delta_mv", esphome::str_sprintf("%.0f", slot_voltage_delta_mv));
+          publish_value("pack_cell_delta_max_mv", esphome::str_sprintf("%.0f", pack_cell_delta_max_mv));
+          publish_value("pack_cell_min_mv", esphome::to_string(pack_cell_min_mv));
+          publish_value("pack_cell_balancer_status", pack_cell_balancer_status);
+          publish_value("pack_series_balancer_status", pack_series_balancer_status);
+          publish_value("pack_cycle_count_max", esphome::to_string(pack_cycle_count_max));
+          publish_value("pack_discharged_ah_total", esphome::to_string((uint32_t) pack_discharged_ah_total));
+          publish_value("groups_json", "[" + group_parts + "]");
+
+          for (size_t gi = 0; gi < groups.size(); gi++) {
+            const std::string gbase = base_topic + "group_" + esphome::to_string((unsigned int)(gi + 1)) + "/";
+
+            std::string slots_csv;
+            for (size_t si = 0; si < groups[gi].slots.size(); si++) {
+              if (si > 0) {
+                slots_csv += ",";
+              }
+              slots_csv += esphome::to_string(groups[gi].slots[si]);
+            }
+
+            id(mqtt_client).publish(gbase + "slots", slots_csv, 0, false);
+            id(mqtt_client).publish(gbase + "voltage_mv", esphome::str_sprintf("%.0f", groups[gi].voltage_mv), 0, false);
+            id(mqtt_client).publish(gbase + "current_ma", esphome::str_sprintf("%.0f", groups[gi].current_ma), 0, false);
+            id(mqtt_client).publish(gbase + "capacity_ah", esphome::str_sprintf("%.0f", groups[gi].capacity_ah), 0, false);
+            id(mqtt_client).publish(gbase + "remain_ah", esphome::str_sprintf("%.0f", groups[gi].remain_ah), 0, false);
+            id(mqtt_client).publish(gbase + "contributors", esphome::to_string(groups[gi].contributing), 0, false);
+          }
+
+  # ===== HOME ASSISTANT MQTT DISCOVERY =====
+  - id: publish_ha_discovery
+    then:
+      - lambda: |-
+          const std::string prefix = "${mqtt_topic_prefix}";
+          const std::string discovery_prefix = "${ha_discovery_prefix}";
+          const std::string system_name = "${battery_system_name}";
+          const std::string node_id = "${gateway_name}";
+          const std::string node_name = "${gateway_friendly_name}";
+
+          auto now = id(sntp_time).now();
+          uint32_t ts = now.is_valid() ? (uint32_t) now.timestamp : 0;
+          if (ts > 0) {
+            id(discovery_last_publish_epoch) = ts;
+          } else if (id(discovery_last_publish_epoch) == 0) {
+            // Sentinel: already published once but without valid time.
+            id(discovery_last_publish_epoch) = 1;
+          }
+          ESP_LOGW("DISCOVERY", "Publishing HA discovery config topics (ts=%u)", ts);
+
+          auto publish_sensor = [&](const std::string &object_id,
+                                    const std::string &name,
+                                    const std::string &state_topic,
+                      const std::string &device_id,
+                      const std::string &device_name,
+                      const std::string &device_model,
+                                    const std::string &unit,
+                                    const std::string &device_class,
+                                    const std::string &state_class,
+                                    const std::string &icon) {
+            std::string cfg_topic = discovery_prefix + "/sensor/" + node_id + "/" + object_id + "/config";
+            std::string payload = "{";
+            payload += "\"name\":\"" + name + "\",";
+            payload += "\"unique_id\":\"" + node_id + "_" + object_id + "\",";
+            payload += "\"state_topic\":\"" + state_topic + "\",";
+            payload += "\"device\":{";
+            payload += "\"identifiers\":[\"" + device_id + "\"],";
+            payload += "\"name\":\"" + device_name + "\",";
+            payload += "\"manufacturer\":\"ESPHome\",";
+            payload += "\"model\":\"" + device_model + "\"";
+            payload += "}";
+
+            if (!unit.empty()) {
+              payload += ",\"unit_of_measurement\":\"" + unit + "\"";
+            }
+            if (!device_class.empty()) {
+              payload += ",\"device_class\":\"" + device_class + "\"";
+            }
+            if (!state_class.empty()) {
+              payload += ",\"state_class\":\"" + state_class + "\"";
+            }
+            if (!icon.empty()) {
+              payload += ",\"icon\":\"" + icon + "\"";
+            }
+
+            payload += "}";
+            id(mqtt_client).publish(cfg_topic, payload, 0, true);
+          };
+
+          auto publish_binary_sensor = [&](const std::string &object_id,
+                                           const std::string &name,
+                                           const std::string &state_topic,
+                                           const std::string &device_id,
+                                           const std::string &device_name,
+                                           const std::string &device_model,
+                                           const std::string &payload_on,
+                                           const std::string &payload_off,
+                                           const std::string &device_class,
+                                           const std::string &icon) {
+            std::string cfg_topic = discovery_prefix + "/binary_sensor/" + node_id + "/" + object_id + "/config";
+            std::string payload = "{";
+            payload += "\"name\":\"" + name + "\",";
+            payload += "\"unique_id\":\"" + node_id + "_" + object_id + "\",";
+            payload += "\"state_topic\":\"" + state_topic + "\",";
+            payload += "\"payload_on\":\"" + payload_on + "\",";
+            payload += "\"payload_off\":\"" + payload_off + "\",";
+            payload += "\"device\":{";
+            payload += "\"identifiers\":[\"" + device_id + "\"],";
+            payload += "\"name\":\"" + device_name + "\",";
+            payload += "\"manufacturer\":\"ESPHome\",";
+            payload += "\"model\":\"" + device_model + "\"";
+            payload += "}";
+
+            if (!device_class.empty()) {
+              payload += ",\"device_class\":\"" + device_class + "\"";
+            }
+            if (!icon.empty()) {
+              payload += ",\"icon\":\"" + icon + "\"";
+            }
+
+            payload += "}";
+            id(mqtt_client).publish(cfg_topic, payload, 0, true);
+          };
+
+          auto publish_epoch_timestamp_sensor = [&](const std::string &object_id,
+                                                    const std::string &name,
+                                                    const std::string &state_topic,
+                                                    const std::string &device_id,
+                                                    const std::string &device_name,
+                                                    const std::string &device_model,
+                                                    const std::string &icon) {
+            std::string cfg_topic = discovery_prefix + "/sensor/" + node_id + "/" + object_id + "/config";
+            std::string payload = "{";
+            payload += "\"name\":\"" + name + "\",";
+            payload += "\"unique_id\":\"" + node_id + "_" + object_id + "\",";
+            payload += "\"state_topic\":\"" + state_topic + "\",";
+            payload += "\"value_template\":\"{{ (value | int) | timestamp_local if (value | int) > 0 else none }}\",";
+            payload += "\"device_class\":\"timestamp\",";
+            payload += "\"device\":{";
+            payload += "\"identifiers\":[\"" + device_id + "\"],";
+            payload += "\"name\":\"" + device_name + "\",";
+            payload += "\"manufacturer\":\"ESPHome\",";
+            payload += "\"model\":\"" + device_model + "\"";
+            payload += "}";
+            if (!icon.empty()) {
+              payload += ",\"icon\":\"" + icon + "\"";
+            }
+            payload += "}";
+            id(mqtt_client).publish(cfg_topic, payload, 0, true);
+          };
+
+          auto publish_slot_fields = [&](int slot, const std::string &slot_name) {
+            const std::string slot_tag = "BMS" + esphome::to_string(slot);
+            const std::string state_base = prefix + "/" + slot_name + "/";
+
+            const std::string dev_id = node_id + "_" + slot_tag;
+            const std::string dev_name = slot_name;
+            const std::string dev_model = "BLE Battery";
+
+            publish_epoch_timestamp_sensor(slot_tag + "_timestamp", "Last Update", state_base + "timestamp", dev_id, dev_name, dev_model, "mdi:clock-outline");
+            publish_sensor(slot_tag + "_ble_name", "BLE Name", state_base + "ble_name", dev_id, dev_name, dev_model, "", "", "", "mdi:bluetooth");
+            publish_sensor(slot_tag + "_ble_mac", "BLE MAC", state_base + "ble_mac", dev_id, dev_name, dev_model, "", "", "", "mdi:identifier");
+            publish_sensor(slot_tag + "_rssi", "RSSI", state_base + "rssi", dev_id, dev_name, dev_model, "dBm", "signal_strength", "measurement", "mdi:wifi");
+            publish_sensor(slot_tag + "_rssi_quality_pct", "RSSI Quality", state_base + "rssi_quality_pct", dev_id, dev_name, dev_model, "%", "", "measurement", "mdi:wifi");
+            publish_sensor(slot_tag + "_rssi_quality", "RSSI Quality Label", state_base + "rssi_quality", dev_id, dev_name, dev_model, "", "", "", "mdi:wifi");
+            publish_sensor(slot_tag + "_voltage_mv", "Voltage", state_base + "voltage_mv", dev_id, dev_name, dev_model, "mV", "voltage", "measurement", "mdi:sine-wave");
+            publish_sensor(slot_tag + "_current_ma", "Current", state_base + "current_ma", dev_id, dev_name, dev_model, "mA", "current", "measurement", "mdi:current-dc");
+            publish_sensor(slot_tag + "_power_w", "Power", state_base + "power_w", dev_id, dev_name, dev_model, "W", "power", "measurement", "mdi:flash");
+            publish_sensor(slot_tag + "_pack_voltage_mv", "Pack Voltage", state_base + "pack_voltage_mv", dev_id, dev_name, dev_model, "mV", "voltage", "measurement", "mdi:car-battery");
+            publish_sensor(slot_tag + "_remain_ah", "Remaining Capacity", state_base + "remain_ah", dev_id, dev_name, dev_model, "Ah", "", "measurement", "mdi:battery-medium");
+            publish_sensor(slot_tag + "_factory_ah", "Nominal Capacity", state_base + "factory_ah", dev_id, dev_name, dev_model, "Ah", "", "measurement", "mdi:battery");
+            publish_sensor(slot_tag + "_cell_temp", "Cell Temperature", state_base + "cell_temp", dev_id, dev_name, dev_model, "°C", "temperature", "measurement", "mdi:thermometer");
+            publish_sensor(slot_tag + "_mosfet_temp", "MOSFET Temperature", state_base + "mosfet_temp", dev_id, dev_name, dev_model, "°C", "temperature", "measurement", "mdi:thermometer-alert");
+            publish_sensor(slot_tag + "_soc", "State of Charge", state_base + "soc", dev_id, dev_name, dev_model, "%", "battery", "measurement", "mdi:battery-heart-variant");
+            publish_sensor(slot_tag + "_soh", "State of Health", state_base + "soh", dev_id, dev_name, dev_model, "%", "", "measurement", "mdi:heart-pulse");
+            publish_sensor(slot_tag + "_cell1_mv", "Cell 1 Voltage", state_base + "cell1_mv", dev_id, dev_name, dev_model, "mV", "voltage", "measurement", "mdi:numeric-1-box-outline");
+            publish_sensor(slot_tag + "_cell2_mv", "Cell 2 Voltage", state_base + "cell2_mv", dev_id, dev_name, dev_model, "mV", "voltage", "measurement", "mdi:numeric-2-box-outline");
+            publish_sensor(slot_tag + "_cell3_mv", "Cell 3 Voltage", state_base + "cell3_mv", dev_id, dev_name, dev_model, "mV", "voltage", "measurement", "mdi:numeric-3-box-outline");
+            publish_sensor(slot_tag + "_cell4_mv", "Cell 4 Voltage", state_base + "cell4_mv", dev_id, dev_name, dev_model, "mV", "voltage", "measurement", "mdi:numeric-4-box-outline");
+            publish_sensor(slot_tag + "_cell_delta_mv", "Cell Voltage Delta", state_base + "cell_delta_mv", dev_id, dev_name, dev_model, "mV", "", "measurement", "mdi:battery-sync");
+            publish_sensor(slot_tag + "_cell_delta_status", "Cell Delta Status", state_base + "cell_delta_status", dev_id, dev_name, dev_model, "", "", "", "mdi:scale-balance");
+            publish_sensor(slot_tag + "_equil_state", "Equalization State", state_base + "equil_state", dev_id, dev_name, dev_model, "", "", "", "mdi:scale-balance");
+            publish_sensor(slot_tag + "_equil_cell", "Equalization Cell", state_base + "equil_cell", dev_id, dev_name, dev_model, "", "", "", "mdi:battery-sync");
+            publish_sensor(slot_tag + "_protect_state", "Protection State", state_base + "protect_state", dev_id, dev_name, dev_model, "", "", "", "mdi:shield-alert-outline");
+            publish_binary_sensor(slot_tag + "_discharge_switch", "Discharge Switch", state_base + "discharge_switch", dev_id, dev_name, dev_model, "ON", "OFF", "", "mdi:toggle-switch-outline");
+            publish_sensor(slot_tag + "_operating_mode_raw", "Operating Mode Raw", state_base + "operating_mode_raw", dev_id, dev_name, dev_model, "", "", "", "mdi:code-tags");
+            publish_sensor(slot_tag + "_operating_mode", "Operating Mode", state_base + "operating_mode", dev_id, dev_name, dev_model, "", "", "", "mdi:engine-outline");
+            publish_sensor(slot_tag + "_cycle_count", "Cycle Count", state_base + "cycle_count", dev_id, dev_name, dev_model, "", "", "total_increasing", "mdi:counter");
+            publish_sensor(slot_tag + "_discharge_ah_count", "Discharged Capacity Total", state_base + "discharge_ah_count", dev_id, dev_name, dev_model, "", "", "total_increasing", "mdi:battery-arrow-down-outline");
+
+          };
+
+          if (std::string("${bms1_enabled}") == "true" && !std::string("${bms1_name}").empty()) publish_slot_fields(1, "${bms1_name}");
+          if (std::string("${bms2_enabled}") == "true" && !std::string("${bms2_name}").empty()) publish_slot_fields(2, "${bms2_name}");
+          if (std::string("${bms3_enabled}") == "true" && !std::string("${bms3_name}").empty()) publish_slot_fields(3, "${bms3_name}");
+          if (std::string("${bms4_enabled}") == "true" && !std::string("${bms4_name}").empty()) publish_slot_fields(4, "${bms4_name}");
+          if (std::string("${bms5_enabled}") == "true" && !std::string("${bms5_name}").empty()) publish_slot_fields(5, "${bms5_name}");
+          if (std::string("${bms6_enabled}") == "true" && !std::string("${bms6_name}").empty()) publish_slot_fields(6, "${bms6_name}");
+
+          const std::string pack_dev_id = node_id + "_pack";
+          const std::string pack_dev_name = system_name;
+          const std::string pack_dev_model = "Battery Pack Aggregate";
+          const std::string pack_base = prefix + "/" + system_name + "/";
+
+          publish_epoch_timestamp_sensor("pack_timestamp", "Last Update", pack_base + "timestamp", pack_dev_id, pack_dev_name, pack_dev_model, "mdi:clock-outline");
+          publish_sensor("pack_power_w", "Pack Power", pack_base + "pack_power_w", pack_dev_id, pack_dev_name, pack_dev_model, "W", "power", "measurement", "mdi:home-lightning-bolt");
+          publish_sensor("pack_voltage_mv", "Pack Voltage", pack_base + "pack_voltage_mv", pack_dev_id, pack_dev_name, pack_dev_model, "mV", "voltage", "measurement", "mdi:sine-wave");
+          publish_sensor("pack_current_ma", "Pack Current", pack_base + "pack_current_ma", pack_dev_id, pack_dev_name, pack_dev_model, "mA", "current", "measurement", "mdi:current-dc");
+          publish_sensor("pack_capacity_ah", "Pack Capacity", pack_base + "pack_capacity_ah", pack_dev_id, pack_dev_name, pack_dev_model, "Ah", "", "measurement", "mdi:battery");
+          publish_sensor("pack_remain_ah", "Remaining Capacity", pack_base + "pack_remain_ah", pack_dev_id, pack_dev_name, pack_dev_model, "Ah", "", "measurement", "mdi:battery-medium");
+          publish_sensor("pack_soc", "Pack State of Charge", pack_base + "pack_soc", pack_dev_id, pack_dev_name, pack_dev_model, "%", "battery", "measurement", "mdi:battery-heart-variant");
+          publish_sensor("pack_cell_temp_min_c", "Min Cell Temperature", pack_base + "pack_cell_temp_min_c", pack_dev_id, pack_dev_name, pack_dev_model, "°C", "temperature", "measurement", "mdi:thermometer-low");
+          publish_sensor("pack_cell_temp_max_c", "Max Cell Temperature", pack_base + "pack_cell_temp_max_c", pack_dev_id, pack_dev_name, pack_dev_model, "°C", "temperature", "measurement", "mdi:thermometer-high");
+          publish_sensor("pack_mosfet_temp_min_c", "Min MOSFET Temperature", pack_base + "pack_mosfet_temp_min_c", pack_dev_id, pack_dev_name, pack_dev_model, "°C", "temperature", "measurement", "mdi:thermometer-low");
+          publish_sensor("pack_mosfet_temp_max_c", "Max MOSFET Temperature", pack_base + "pack_mosfet_temp_max_c", pack_dev_id, pack_dev_name, pack_dev_model, "°C", "temperature", "measurement", "mdi:thermometer-high");
+          publish_sensor("pack_rssi_weakest_dbm", "Weakest RSSI", pack_base + "pack_rssi_weakest_dbm", pack_dev_id, pack_dev_name, pack_dev_model, "dBm", "signal_strength", "measurement", "mdi:wifi");
+          publish_sensor("pack_rssi_quality_pct", "RSSI Quality", pack_base + "pack_rssi_quality_pct", pack_dev_id, pack_dev_name, pack_dev_model, "%", "", "measurement", "mdi:wifi");
+          publish_sensor("pack_rssi_quality", "RSSI Quality Label", pack_base + "pack_rssi_quality", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "", "mdi:wifi");
+          publish_sensor("series_group_voltage_delta_mv", "Series Group Voltage Delta", pack_base + "series_group_voltage_delta_mv", pack_dev_id, pack_dev_name, pack_dev_model, "mV", "", "measurement", "mdi:delta");
+          publish_sensor("slot_voltage_delta_mv", "Battery Voltage Spread", pack_base + "slot_voltage_delta_mv", pack_dev_id, pack_dev_name, pack_dev_model, "mV", "", "measurement", "mdi:delta");
+          publish_sensor("pack_cell_delta_max_mv", "Max Cell Voltage Delta", pack_base + "pack_cell_delta_max_mv", pack_dev_id, pack_dev_name, pack_dev_model, "mV", "", "measurement", "mdi:battery-sync");
+          publish_sensor("pack_cell_balancer_status", "Cell Voltage Delta Status", pack_base + "pack_cell_balancer_status", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "", "mdi:scale-balance");
+          publish_sensor("pack_series_balancer_status", "Series Group Voltage Delta Status", pack_base + "pack_series_balancer_status", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "", "mdi:scale-balance");
+          publish_sensor("pack_cycle_count_max", "Pack Max Cycle Count", pack_base + "pack_cycle_count_max", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "measurement", "mdi:counter");
+          publish_sensor("pack_discharged_ah_total", "Pack Discharged Capacity Total", pack_base + "pack_discharged_ah_total", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "total_increasing", "mdi:battery-arrow-down-outline");
+          publish_sensor("active_slots", "Batteries Reporting", pack_base + "active_slots", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "measurement", "mdi:counter");
+          publish_sensor("expected_slots", "Batteries Expected", pack_base + "expected_slots", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "measurement", "mdi:counter");
+          publish_sensor("topology_reporting", "Topology Reporting", pack_base + "topology_reporting", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "", "mdi:format-list-numbered");
+          publish_sensor("series_groups", "Configured Series Groups", pack_base + "series_groups", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "measurement", "mdi:counter");
+          publish_binary_sensor("topology_complete", "Topology Complete", pack_base + "topology_complete", pack_dev_id, pack_dev_name, pack_dev_model, "true", "false", "", "mdi:check-decagram");
+
+
+  # ===== READ ROUTINES =====
+  - id: read_bms1
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: return !std::string("${bms1_name}").empty() && std::string("${bms1_enabled}") == "true" && (!std::string("${bms1_mac}").empty() || !id(bms1_bound_mac).empty());
+          then:
+            - lambda: |-
+                std::string effective_mac = !std::string("${bms1_mac}").empty() ? std::string("${bms1_mac}") : id(bms1_bound_mac);
+                unsigned int b0, b1, b2, b3, b4, b5;
+                if (sscanf(effective_mac.c_str(), "%02x:%02x:%02x:%02x:%02x:%02x", &b0, &b1, &b2, &b3, &b4, &b5) == 6) {
+                  uint64_t addr = ((uint64_t)b0 << 40) | ((uint64_t)b1 << 32) | ((uint64_t)b2 << 24) | ((uint64_t)b3 << 16) | ((uint64_t)b4 << 8) | (uint64_t)b5;
+                  id(bms1_ble_client).set_address(addr);
+                }
+            - globals.set: { id: bms1_frame_received, value: "false" }
+            - ble_client.connect: bms1_ble_client
+            - delay: ${ble_connect_timeout}
+            - ble_client.ble_write:
+                id: bms1_ble_client
+                service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb"
+                characteristic_uuid: "0000ffe2-0000-1000-8000-00805f9b34fb"
+                value: [0x00, 0x00, 0x04, 0x01, 0x13, 0x55, 0xAA, 0x17]
+            - delay: ${ble_read_timeout}
+            - if:
+                condition: { lambda: return id(bms1_frame_received); }
+                then:
+                  - script.execute: publish_bms1
+                else:
+                  - logger.log:
+                      level: WARN
+                      format: "BMS1: first read attempt failed, retrying BLE session"
+                  - ble_client.disconnect: bms1_ble_client
+                  - delay: ${ble_disconnect_settle_delay}
+                  - delay: ${ble_retry_backoff_delay}
+                  - globals.set: { id: bms1_frame_received, value: "false" }
+                  - ble_client.connect: bms1_ble_client
+                  - delay: ${ble_connect_timeout}
+                  - ble_client.ble_write:
+                      id: bms1_ble_client
+                      service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb"
+                      characteristic_uuid: "0000ffe2-0000-1000-8000-00805f9b34fb"
+                      value: [0x00, 0x00, 0x04, 0x01, 0x13, 0x55, 0xAA, 0x17]
+                  - delay: ${ble_read_timeout}
+                  - if:
+                      condition: { lambda: return id(bms1_frame_received); }
+                      then:
+                        - script.execute: publish_bms1
+                      else:
+                        - globals.set: { id: bms1_connected, value: "false" }
+            - ble_client.disconnect: bms1_ble_client
+            - delay: ${ble_disconnect_settle_delay}
+            - delay: ${ble_sequential_delay}
+
+  - id: read_bms2
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: return !std::string("${bms2_name}").empty() && std::string("${bms2_enabled}") == "true" && (!std::string("${bms2_mac}").empty() || !id(bms2_bound_mac).empty());
+          then:
+            - lambda: |-
+                std::string effective_mac = !std::string("${bms2_mac}").empty() ? std::string("${bms2_mac}") : id(bms2_bound_mac);
+                unsigned int b0, b1, b2, b3, b4, b5;
+                if (sscanf(effective_mac.c_str(), "%02x:%02x:%02x:%02x:%02x:%02x", &b0, &b1, &b2, &b3, &b4, &b5) == 6) {
+                  uint64_t addr = ((uint64_t)b0 << 40) | ((uint64_t)b1 << 32) | ((uint64_t)b2 << 24) | ((uint64_t)b3 << 16) | ((uint64_t)b4 << 8) | (uint64_t)b5;
+                  id(bms2_ble_client).set_address(addr);
+                }
+            - globals.set: { id: bms2_frame_received, value: "false" }
+            - ble_client.connect: bms2_ble_client
+            - delay: ${ble_connect_timeout}
+            - ble_client.ble_write:
+                id: bms2_ble_client
+                service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb"
+                characteristic_uuid: "0000ffe2-0000-1000-8000-00805f9b34fb"
+                value: [0x00, 0x00, 0x04, 0x01, 0x13, 0x55, 0xAA, 0x17]
+            - delay: ${ble_read_timeout}
+            - if:
+                condition: { lambda: return id(bms2_frame_received); }
+                then:
+                  - script.execute: publish_bms2
+                else:
+                  - logger.log:
+                      level: WARN
+                      format: "BMS2: first read attempt failed, retrying BLE session"
+                  - ble_client.disconnect: bms2_ble_client
+                  - delay: ${ble_disconnect_settle_delay}
+                  - delay: ${ble_retry_backoff_delay}
+                  - globals.set: { id: bms2_frame_received, value: "false" }
+                  - ble_client.connect: bms2_ble_client
+                  - delay: ${ble_connect_timeout}
+                  - ble_client.ble_write:
+                      id: bms2_ble_client
+                      service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb"
+                      characteristic_uuid: "0000ffe2-0000-1000-8000-00805f9b34fb"
+                      value: [0x00, 0x00, 0x04, 0x01, 0x13, 0x55, 0xAA, 0x17]
+                  - delay: ${ble_read_timeout}
+                  - if:
+                      condition: { lambda: return id(bms2_frame_received); }
+                      then:
+                        - script.execute: publish_bms2
+                      else:
+                        - globals.set: { id: bms2_connected, value: "false" }
+            - ble_client.disconnect: bms2_ble_client
+            - delay: ${ble_disconnect_settle_delay}
+            - delay: ${ble_sequential_delay}
+
+  - id: read_bms3
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: return !std::string("${bms3_name}").empty() && std::string("${bms3_enabled}") == "true" && (!std::string("${bms3_mac}").empty() || !id(bms3_bound_mac).empty());
+          then:
+            - lambda: |-
+                std::string effective_mac = !std::string("${bms3_mac}").empty() ? std::string("${bms3_mac}") : id(bms3_bound_mac);
+                unsigned int b0, b1, b2, b3, b4, b5;
+                if (sscanf(effective_mac.c_str(), "%02x:%02x:%02x:%02x:%02x:%02x", &b0, &b1, &b2, &b3, &b4, &b5) == 6) {
+                  uint64_t addr = ((uint64_t)b0 << 40) | ((uint64_t)b1 << 32) | ((uint64_t)b2 << 24) | ((uint64_t)b3 << 16) | ((uint64_t)b4 << 8) | (uint64_t)b5;
+                  id(bms3_ble_client).set_address(addr);
+                }
+            - globals.set: { id: bms3_frame_received, value: "false" }
+            - ble_client.connect: bms3_ble_client
+            - delay: ${ble_connect_timeout}
+            - ble_client.ble_write: { id: bms3_ble_client, service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb", characteristic_uuid: "0000ffe2-0000-1000-8000-00805f9b34fb", value: [0x00, 0x00, 0x04, 0x01, 0x13, 0x55, 0xAA, 0x17] }
+            - delay: ${ble_read_timeout}
+            - if:
+                condition: { lambda: return id(bms3_frame_received); }
+                then:
+                  - script.execute: publish_bms3
+                else:
+                  - globals.set: { id: bms3_connected, value: "false" }
+            - ble_client.disconnect: bms3_ble_client
+            - delay: ${ble_sequential_delay}
+
+  - id: read_bms4
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: return !std::string("${bms4_name}").empty() && std::string("${bms4_enabled}") == "true" && (!std::string("${bms4_mac}").empty() || !id(bms4_bound_mac).empty());
+          then:
+            - lambda: |-
+                std::string effective_mac = !std::string("${bms4_mac}").empty() ? std::string("${bms4_mac}") : id(bms4_bound_mac);
+                unsigned int b0, b1, b2, b3, b4, b5;
+                if (sscanf(effective_mac.c_str(), "%02x:%02x:%02x:%02x:%02x:%02x", &b0, &b1, &b2, &b3, &b4, &b5) == 6) {
+                  uint64_t addr = ((uint64_t)b0 << 40) | ((uint64_t)b1 << 32) | ((uint64_t)b2 << 24) | ((uint64_t)b3 << 16) | ((uint64_t)b4 << 8) | (uint64_t)b5;
+                  id(bms4_ble_client).set_address(addr);
+                }
+            - globals.set: { id: bms4_frame_received, value: "false" }
+            - ble_client.connect: bms4_ble_client
+            - delay: ${ble_connect_timeout}
+            - ble_client.ble_write: { id: bms4_ble_client, service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb", characteristic_uuid: "0000ffe2-0000-1000-8000-00805f9b34fb", value: [0x00, 0x00, 0x04, 0x01, 0x13, 0x55, 0xAA, 0x17] }
+            - delay: ${ble_read_timeout}
+            - if:
+                condition: { lambda: return id(bms4_frame_received); }
+                then:
+                  - script.execute: publish_bms4
+                else:
+                  - globals.set: { id: bms4_connected, value: "false" }
+            - ble_client.disconnect: bms4_ble_client
+            - delay: ${ble_sequential_delay}
+
+  - id: read_bms5
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: return !std::string("${bms5_name}").empty() && std::string("${bms5_enabled}") == "true" && (!std::string("${bms5_mac}").empty() || !id(bms5_bound_mac).empty());
+          then:
+            - lambda: |-
+                std::string effective_mac = !std::string("${bms5_mac}").empty() ? std::string("${bms5_mac}") : id(bms5_bound_mac);
+                unsigned int b0, b1, b2, b3, b4, b5;
+                if (sscanf(effective_mac.c_str(), "%02x:%02x:%02x:%02x:%02x:%02x", &b0, &b1, &b2, &b3, &b4, &b5) == 6) {
+                  uint64_t addr = ((uint64_t)b0 << 40) | ((uint64_t)b1 << 32) | ((uint64_t)b2 << 24) | ((uint64_t)b3 << 16) | ((uint64_t)b4 << 8) | (uint64_t)b5;
+                  id(bms5_ble_client).set_address(addr);
+                }
+            - globals.set: { id: bms5_frame_received, value: "false" }
+            - ble_client.connect: bms5_ble_client
+            - delay: ${ble_connect_timeout}
+            - ble_client.ble_write: { id: bms5_ble_client, service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb", characteristic_uuid: "0000ffe2-0000-1000-8000-00805f9b34fb", value: [0x00, 0x00, 0x04, 0x01, 0x13, 0x55, 0xAA, 0x17] }
+            - delay: ${ble_read_timeout}
+            - if:
+                condition: { lambda: return id(bms5_frame_received); }
+                then:
+                  - script.execute: publish_bms5
+                else:
+                  - globals.set: { id: bms5_connected, value: "false" }
+            - ble_client.disconnect: bms5_ble_client
+            - delay: ${ble_sequential_delay}
+
+  - id: read_bms6
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: return !std::string("${bms6_name}").empty() && std::string("${bms6_enabled}") == "true" && (!std::string("${bms6_mac}").empty() || !id(bms6_bound_mac).empty());
+          then:
+            - lambda: |-
+                std::string effective_mac = !std::string("${bms6_mac}").empty() ? std::string("${bms6_mac}") : id(bms6_bound_mac);
+                unsigned int b0, b1, b2, b3, b4, b5;
+                if (sscanf(effective_mac.c_str(), "%02x:%02x:%02x:%02x:%02x:%02x", &b0, &b1, &b2, &b3, &b4, &b5) == 6) {
+                  uint64_t addr = ((uint64_t)b0 << 40) | ((uint64_t)b1 << 32) | ((uint64_t)b2 << 24) | ((uint64_t)b3 << 16) | ((uint64_t)b4 << 8) | (uint64_t)b5;
+                  id(bms6_ble_client).set_address(addr);
+                }
+            - globals.set: { id: bms6_frame_received, value: "false" }
+            - ble_client.connect: bms6_ble_client
+            - delay: ${ble_connect_timeout}
+            - ble_client.ble_write: { id: bms6_ble_client, service_uuid: "0000ffe0-0000-1000-8000-00805f9b34fb", characteristic_uuid: "0000ffe2-0000-1000-8000-00805f9b34fb", value: [0x00, 0x00, 0x04, 0x01, 0x13, 0x55, 0xAA, 0x17] }
+            - delay: ${ble_read_timeout}
+            - if:
+                condition: { lambda: return id(bms6_frame_received); }
+                then:
+                  - script.execute: publish_bms6
+                else:
+                  - globals.set: { id: bms6_connected, value: "false" }
+            - ble_client.disconnect: bms6_ble_client
+            - delay: ${ble_sequential_delay}
+
+  # ===== MAIN CYCLE =====
+  - id: read_and_publish_all
+    mode: single
+    then:
+      - lambda: |-
+          uint32_t now_ts = 0;
+          auto now = id(sntp_time).now();
+          if (now.is_valid()) {
+            now_ts = (uint32_t) now.timestamp;
+          } else {
+            now_ts = (uint32_t) (millis() / 1000UL);
+          }
+          id(read_cycle_running) = true;
+          id(read_cycle_start_epoch) = now_ts;
+      - if:
+          condition:
+            and:
+              - wifi.connected:
+              - mqtt.connected:
+          then:
+            - esp32_ble_tracker.stop_scan:
+            - logger.log: "Starting multi-battery read cycle"
+            - script.execute: read_bms1
+            - script.wait: read_bms1
+            - script.execute: read_bms2
+            - script.wait: read_bms2
+            - script.execute: read_bms3
+            - script.wait: read_bms3
+            - script.execute: read_bms4
+            - script.wait: read_bms4
+            - script.execute: read_bms5
+            - script.wait: read_bms5
+            - script.execute: read_bms6
+            - script.wait: read_bms6
+            - script.execute: publish_system_aggregate
+            - esp32_ble_tracker.start_scan:
+            - logger.log: "Multi-battery read cycle complete"
+            - lambda: |-
+                uint32_t now_ts = 0;
+                auto now = id(sntp_time).now();
+                if (now.is_valid()) {
+                  now_ts = (uint32_t) now.timestamp;
+                } else {
+                  now_ts = (uint32_t) (millis() / 1000UL);
+                }
+                id(read_cycle_last_success_epoch) = now_ts;
+                id(watchdog_recovery_count) = 0;
+          else:
+            - logger.log:
+                level: WARN
+                format: "Skipping read cycle (wifi=%s, mqtt=%s)"
+                args:
+                  - 'wifi::global_wifi_component->is_connected() ? "connected" : "not_connected"'
+                  - 'id(mqtt_client).is_connected() ? "connected" : "not_connected"'
+      - lambda: |-
+          id(read_cycle_running) = false;
+
+# ═══════════════════════════════════════════════════════════════════════
+# INTERVALS — poll cycle, watchdog, periodic status publish
+# ═══════════════════════════════════════════════════════════════════════
+interval:
+  - interval: ${poll_interval}
+    then:
+      - if:
+          condition:
+            lambda: return !id(read_and_publish_all).is_running();
+          then:
+            - script.execute: read_and_publish_all
+          else:
+            - logger.log:
+                level: WARN
+                format: "Skipping cycle trigger (read_and_publish_all still running)"
+
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            and:
+              - wifi.connected:
+              - mqtt.connected:
+          then:
+            - lambda: |-
+                uint32_t now_ts = 0;
+                auto now = id(sntp_time).now();
+                if (now.is_valid()) {
+                  now_ts = (uint32_t) now.timestamp;
+                } else {
+                  now_ts = (uint32_t) (millis() / 1000UL);
+                }
+
+                const uint32_t hang_timeout_s = (uint32_t) atoi("${watchdog_hang_timeout_s}");
+                const uint32_t idle_recover_s = (uint32_t) atoi("${watchdog_idle_recover_s}");
+                const uint32_t reboot_after = (uint32_t) atoi("${watchdog_reboot_after_recoveries}");
+
+                if (id(read_cycle_running) && id(read_cycle_start_epoch) > 0 && (now_ts - id(read_cycle_start_epoch)) > hang_timeout_s) {
+                  id(watchdog_recovery_count) += 1U;
+                  if (id(watchdog_recovery_count) < reboot_after) {
+                    ESP_LOGE("WATCHDOG", "Read cycle hang detected (>%us). Soft recovery #%u", (unsigned int) hang_timeout_s, (unsigned int) id(watchdog_recovery_count));
+                    id(recover_from_stuck_cycle).execute();
+                  } else {
+                    ESP_LOGE("WATCHDOG", "Read cycle hang persists (>%us). Reboot #%u", (unsigned int) hang_timeout_s, (unsigned int) id(watchdog_recovery_count));
+                    ESP.restart();
+                  }
+                  return;
+                }
+
+                if (!id(read_cycle_running) && id(read_cycle_last_success_epoch) > 0 && (now_ts - id(read_cycle_last_success_epoch)) > idle_recover_s) {
+                  ESP_LOGW("WATCHDOG", "No successful cycle for >%us. Triggering recovery cycle.", (unsigned int) idle_recover_s);
+                  id(read_and_publish_all).execute();
+                }
+
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            and:
+              - wifi.connected:
+              - mqtt.connected:
+          then:
+            - script.execute: publish_gateway_status
+
+# ═══════════════════════════════════════════════════════════════════════
+# SWITCH — manual read trigger
+# ═══════════════════════════════════════════════════════════════════════
+switch:
+  - platform: template
+    name: "Read All Batteries (Manual)"
+    id: bms_manual_read
+    turn_on_action:
+      - if:
+          condition:
+            lambda: return !id(read_and_publish_all).is_running();
+          then:
+            - script.execute: read_and_publish_all
+          else:
+            - logger.log:
+                level: WARN
+                format: "Manual trigger ignored (read_and_publish_all still running)"
+    turn_off_action: []
+    lambda: return false;
