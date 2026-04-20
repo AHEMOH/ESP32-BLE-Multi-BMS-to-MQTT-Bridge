@@ -2,6 +2,8 @@
 
 ESPHome-based BLE gateway for LiTime, PowerQueen, and Redodo BMS devices. Reads up to 6 batteries sequentially via BLE, publishes per-battery MQTT topics, computes pack-level aggregate metrics, and exposes entities via Home Assistant MQTT Discovery.
 
+> Based on `dmytro-tsepilov/pq_bms_bluetooth`. Special thanks to the original project; this repository is a full ESPHome rewrite with additional reverse-engineering and protocol enhancements.
+
 ## Quick Start
 
 1. Open ESPHome dashboard (Home Assistant add-on or standalone).
