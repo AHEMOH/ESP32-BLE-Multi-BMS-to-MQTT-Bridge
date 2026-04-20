@@ -5,7 +5,7 @@ ESPHome-based BLE gateway for LiTime, PowerQueen, and Redodo BMS devices. Reads 
 ## Quick Start
 
 1. Open ESPHome dashboard (Home Assistant add-on or standalone).
-2. Create a new node, paste `bms_bt_mqtt.yaml`.
+2. Create a new node, paste `esp32-ble-battery-bridge.yaml`.
 3. Fill in `secrets.yaml` with required credentials.
 4. Set battery slots in the `substitutions` section.
 5. Validate, compile, and flash.
@@ -67,8 +67,10 @@ Base prefix: `ble_battery` (configurable via `mqtt_topic_prefix`).
 | `voltage_mv`, `current_ma`, `power_w` | Electrical state |
 | `pack_voltage_mv` | Secondary voltage reading |
 | `soc`, `soh` | State of charge / health (%) |
-| `cell1_mv`–`cell4_mv`, `cell_delta_mv` | Per-cell voltages |
-| `cell_delta_status` | `good` / `light` / `warning` / `critical` |
+| `cell1_mv`–`cell4_mv` | Per-cell voltages |
+| `cell_min_mv`, `cell_max_mv` | Weakest / strongest cell voltage |
+| `cell_delta_mv`, `cell_delta_status` | Cell spread and balance status |
+| `cell_voltage_status` | `critical_low` / `low` / `normal` / `high` (based on weakest cell) |
 | `cell_temp`, `mosfet_temp` | Temperatures (°C) |
 | `remain_ah`, `factory_ah` | Remaining / nominal capacity |
 | `discharge_switch` | `ON` / `OFF` (derived from status_flags bit 0x80) |
@@ -80,7 +82,7 @@ Base prefix: `ble_battery` (configurable via `mqtt_topic_prefix`).
 
 **Pack / system aggregate** (`ble_battery/<battery_system_name>/`):
 
-`pack_voltage_mv`, `pack_current_ma`, `pack_power_w`, `pack_soc`, `pack_capacity_ah`, `pack_remain_ah`, `series_group_voltage_delta_mv`, `slot_voltage_delta_mv`, `pack_cell_delta_max_mv`, `pack_cell_balancer_status`, `pack_series_balancer_status`, `group_1/voltage_mv` … (per-group sub-topics), `topology`, `topology_reporting`, `topology_complete`
+`pack_voltage_mv`, `pack_current_ma`, `pack_power_w`, `pack_soc`, `pack_capacity_ah`, `pack_remain_ah`, `series_group_voltage_delta_mv`, `slot_voltage_delta_mv`, `pack_cell_delta_max_mv`, `pack_cell_min_mv`, `pack_cell_balancer_status`, `pack_series_balancer_status`, `group_1/voltage_mv` … (per-group sub-topics), `topology`, `topology_reporting`, `topology_complete`
 
 **Gateway health** (`ble_battery/esp32-battery-bridge/`):
 
@@ -130,14 +132,24 @@ To remove stale entities: delete the retained discovery config topics in an MQTT
 
 ### Balancer Thresholds
 
-**Cell delta** (within one battery):
+**Cell delta** (within one battery, tuned for passive single-cell balancers on LiFePO4):
 
 | Range | Status |
 |-------|--------|
-| ≤ 10 mV | `good` |
-| ≤ 20 mV | `light` |
-| ≤ 40 mV | `warning` |
-| > 40 mV | `critical` |
+| ≤ 10 mV | `excellent` |
+| ≤ 25 mV | `good` |
+| ≤ 40 mV | `normal` |
+| ≤ 60 mV | `warning` |
+| > 60 mV | `critical` |
+
+**Cell voltage status** (based on weakest cell, LiFePO4 4S):
+
+| Weakest cell | Status |
+|-------------|--------|
+| ≥ 3500 mV | `high` (charging / ≥ 90% SoC) |
+| ≥ 3050 mV | `normal` (typical working range) |
+| ≥ 2900 mV | `low` (approx. ≤ 15% SoC) |
+| < 2900 mV | `critical_low` (near BMS cutoff) |
 
 **Series group delta** (between 12V packs):
 

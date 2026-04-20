@@ -1673,7 +1673,8 @@ script:
           if (id(bms1_cell3_mv) < cell_min_mv) cell_min_mv = id(bms1_cell3_mv);
           if (id(bms1_cell4_mv) < cell_min_mv) cell_min_mv = id(bms1_cell4_mv);
           uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
-          const char *cell_delta_status = cell_delta_mv <= 10 ? "good" : (cell_delta_mv <= 20 ? "light" : (cell_delta_mv <= 40 ? "warning" : "critical"));
+          const char *cell_delta_status = cell_delta_mv <= 10 ? "excellent" : (cell_delta_mv <= 25 ? "good" : (cell_delta_mv <= 40 ? "normal" : (cell_delta_mv <= 60 ? "warning" : "critical")));
+          const char *cell_voltage_status = cell_min_mv < 2900 ? "critical_low" : (cell_min_mv < 3050 ? "low" : (cell_min_mv < 3500 ? "normal" : "high"));
           const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
           auto publish_value = [&](const std::string &field, const std::string &value) {
             id(mqtt_client).publish(base_topic + field, value, 0, false);
@@ -1699,8 +1700,11 @@ script:
           publish_value("cell2_mv", esphome::to_string(id(bms1_cell2_mv)));
           publish_value("cell3_mv", esphome::to_string(id(bms1_cell3_mv)));
           publish_value("cell4_mv", esphome::to_string(id(bms1_cell4_mv)));
+          publish_value("cell_min_mv", esphome::to_string(cell_min_mv));
+          publish_value("cell_max_mv", esphome::to_string(cell_max_mv));
           publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
           publish_value("cell_delta_status", cell_delta_status);
+          publish_value("cell_voltage_status", cell_voltage_status);
           publish_value("equil_state", esphome::to_string(id(bms1_equil_state)));
           std::string bms1_equil_cell;
           uint8_t bms1_eq = id(bms1_equil_state);
@@ -1756,7 +1760,8 @@ script:
           if (id(bms2_cell3_mv) < cell_min_mv) cell_min_mv = id(bms2_cell3_mv);
           if (id(bms2_cell4_mv) < cell_min_mv) cell_min_mv = id(bms2_cell4_mv);
           uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
-          const char *cell_delta_status = cell_delta_mv <= 10 ? "good" : (cell_delta_mv <= 20 ? "light" : (cell_delta_mv <= 40 ? "warning" : "critical"));
+          const char *cell_delta_status = cell_delta_mv <= 10 ? "excellent" : (cell_delta_mv <= 25 ? "good" : (cell_delta_mv <= 40 ? "normal" : (cell_delta_mv <= 60 ? "warning" : "critical")));
+          const char *cell_voltage_status = cell_min_mv < 2900 ? "critical_low" : (cell_min_mv < 3050 ? "low" : (cell_min_mv < 3500 ? "normal" : "high"));
           const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
           auto publish_value = [&](const std::string &field, const std::string &value) {
             id(mqtt_client).publish(base_topic + field, value, 0, false);
@@ -1782,8 +1787,11 @@ script:
           publish_value("cell2_mv", esphome::to_string(id(bms2_cell2_mv)));
           publish_value("cell3_mv", esphome::to_string(id(bms2_cell3_mv)));
           publish_value("cell4_mv", esphome::to_string(id(bms2_cell4_mv)));
+          publish_value("cell_min_mv", esphome::to_string(cell_min_mv));
+          publish_value("cell_max_mv", esphome::to_string(cell_max_mv));
           publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
           publish_value("cell_delta_status", cell_delta_status);
+          publish_value("cell_voltage_status", cell_voltage_status);
           publish_value("equil_state", esphome::to_string(id(bms2_equil_state)));
           std::string bms2_equil_cell;
           uint8_t bms2_eq = id(bms2_equil_state);
@@ -1839,7 +1847,8 @@ script:
           if (id(bms3_cell3_mv) < cell_min_mv) cell_min_mv = id(bms3_cell3_mv);
           if (id(bms3_cell4_mv) < cell_min_mv) cell_min_mv = id(bms3_cell4_mv);
           uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
-          const char *cell_delta_status = cell_delta_mv <= 10 ? "good" : (cell_delta_mv <= 20 ? "light" : (cell_delta_mv <= 40 ? "warning" : "critical"));
+          const char *cell_delta_status = cell_delta_mv <= 10 ? "excellent" : (cell_delta_mv <= 25 ? "good" : (cell_delta_mv <= 40 ? "normal" : (cell_delta_mv <= 60 ? "warning" : "critical")));
+          const char *cell_voltage_status = cell_min_mv < 2900 ? "critical_low" : (cell_min_mv < 3050 ? "low" : (cell_min_mv < 3500 ? "normal" : "high"));
           const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
           auto publish_value = [&](const std::string &field, const std::string &value) {
             id(mqtt_client).publish(base_topic + field, value, 0, false);
@@ -1865,8 +1874,11 @@ script:
           publish_value("cell2_mv", esphome::to_string(id(bms3_cell2_mv)));
           publish_value("cell3_mv", esphome::to_string(id(bms3_cell3_mv)));
           publish_value("cell4_mv", esphome::to_string(id(bms3_cell4_mv)));
+          publish_value("cell_min_mv", esphome::to_string(cell_min_mv));
+          publish_value("cell_max_mv", esphome::to_string(cell_max_mv));
           publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
           publish_value("cell_delta_status", cell_delta_status);
+          publish_value("cell_voltage_status", cell_voltage_status);
           publish_value("equil_state", esphome::to_string(id(bms3_equil_state)));
           std::string bms3_equil_cell;
           uint8_t bms3_eq = id(bms3_equil_state);
@@ -1921,7 +1933,8 @@ script:
           if (id(bms4_cell3_mv) < cell_min_mv) cell_min_mv = id(bms4_cell3_mv);
           if (id(bms4_cell4_mv) < cell_min_mv) cell_min_mv = id(bms4_cell4_mv);
           uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
-          const char *cell_delta_status = cell_delta_mv <= 10 ? "good" : (cell_delta_mv <= 20 ? "light" : (cell_delta_mv <= 40 ? "warning" : "critical"));
+          const char *cell_delta_status = cell_delta_mv <= 10 ? "excellent" : (cell_delta_mv <= 25 ? "good" : (cell_delta_mv <= 40 ? "normal" : (cell_delta_mv <= 60 ? "warning" : "critical")));
+          const char *cell_voltage_status = cell_min_mv < 2900 ? "critical_low" : (cell_min_mv < 3050 ? "low" : (cell_min_mv < 3500 ? "normal" : "high"));
           const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
           auto publish_value = [&](const std::string &field, const std::string &value) {
             id(mqtt_client).publish(base_topic + field, value, 0, false);
@@ -1947,8 +1960,11 @@ script:
           publish_value("cell2_mv", esphome::to_string(id(bms4_cell2_mv)));
           publish_value("cell3_mv", esphome::to_string(id(bms4_cell3_mv)));
           publish_value("cell4_mv", esphome::to_string(id(bms4_cell4_mv)));
+          publish_value("cell_min_mv", esphome::to_string(cell_min_mv));
+          publish_value("cell_max_mv", esphome::to_string(cell_max_mv));
           publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
           publish_value("cell_delta_status", cell_delta_status);
+          publish_value("cell_voltage_status", cell_voltage_status);
           publish_value("equil_state", esphome::to_string(id(bms4_equil_state)));
           std::string bms4_equil_cell;
           uint8_t bms4_eq = id(bms4_equil_state);
@@ -2003,7 +2019,8 @@ script:
           if (id(bms5_cell3_mv) < cell_min_mv) cell_min_mv = id(bms5_cell3_mv);
           if (id(bms5_cell4_mv) < cell_min_mv) cell_min_mv = id(bms5_cell4_mv);
           uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
-          const char *cell_delta_status = cell_delta_mv <= 10 ? "good" : (cell_delta_mv <= 20 ? "light" : (cell_delta_mv <= 40 ? "warning" : "critical"));
+          const char *cell_delta_status = cell_delta_mv <= 10 ? "excellent" : (cell_delta_mv <= 25 ? "good" : (cell_delta_mv <= 40 ? "normal" : (cell_delta_mv <= 60 ? "warning" : "critical")));
+          const char *cell_voltage_status = cell_min_mv < 2900 ? "critical_low" : (cell_min_mv < 3050 ? "low" : (cell_min_mv < 3500 ? "normal" : "high"));
           const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
           auto publish_value = [&](const std::string &field, const std::string &value) {
             id(mqtt_client).publish(base_topic + field, value, 0, false);
@@ -2029,8 +2046,11 @@ script:
           publish_value("cell2_mv", esphome::to_string(id(bms5_cell2_mv)));
           publish_value("cell3_mv", esphome::to_string(id(bms5_cell3_mv)));
           publish_value("cell4_mv", esphome::to_string(id(bms5_cell4_mv)));
+          publish_value("cell_min_mv", esphome::to_string(cell_min_mv));
+          publish_value("cell_max_mv", esphome::to_string(cell_max_mv));
           publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
           publish_value("cell_delta_status", cell_delta_status);
+          publish_value("cell_voltage_status", cell_voltage_status);
           publish_value("equil_state", esphome::to_string(id(bms5_equil_state)));
           std::string bms5_equil_cell;
           uint8_t bms5_eq = id(bms5_equil_state);
@@ -2085,7 +2105,8 @@ script:
           if (id(bms6_cell3_mv) < cell_min_mv) cell_min_mv = id(bms6_cell3_mv);
           if (id(bms6_cell4_mv) < cell_min_mv) cell_min_mv = id(bms6_cell4_mv);
           uint16_t cell_delta_mv = cell_max_mv - cell_min_mv;
-          const char *cell_delta_status = cell_delta_mv <= 10 ? "good" : (cell_delta_mv <= 20 ? "light" : (cell_delta_mv <= 40 ? "warning" : "critical"));
+          const char *cell_delta_status = cell_delta_mv <= 10 ? "excellent" : (cell_delta_mv <= 25 ? "good" : (cell_delta_mv <= 40 ? "normal" : (cell_delta_mv <= 60 ? "warning" : "critical")));
+          const char *cell_voltage_status = cell_min_mv < 2900 ? "critical_low" : (cell_min_mv < 3050 ? "low" : (cell_min_mv < 3500 ? "normal" : "high"));
           const std::string base_topic = std::string("${mqtt_topic_prefix}") + "/" + ble_name + "/";
           auto publish_value = [&](const std::string &field, const std::string &value) {
             id(mqtt_client).publish(base_topic + field, value, 0, false);
@@ -2111,8 +2132,11 @@ script:
           publish_value("cell2_mv", esphome::to_string(id(bms6_cell2_mv)));
           publish_value("cell3_mv", esphome::to_string(id(bms6_cell3_mv)));
           publish_value("cell4_mv", esphome::to_string(id(bms6_cell4_mv)));
+          publish_value("cell_min_mv", esphome::to_string(cell_min_mv));
+          publish_value("cell_max_mv", esphome::to_string(cell_max_mv));
           publish_value("cell_delta_mv", esphome::to_string(cell_delta_mv));
           publish_value("cell_delta_status", cell_delta_status);
+          publish_value("cell_voltage_status", cell_voltage_status);
           publish_value("equil_state", esphome::to_string(id(bms6_equil_state)));
           std::string bms6_equil_cell;
           uint8_t bms6_eq = id(bms6_equil_state);
@@ -2254,6 +2278,25 @@ script:
             return vmax - vmin;
           };
 
+          auto slot_cell_min_mv = [&](int slot) -> uint16_t {
+            uint16_t c1 = 0, c2 = 0, c3 = 0, c4 = 0;
+            switch (slot) {
+              case 1: c1 = id(bms1_cell1_mv); c2 = id(bms1_cell2_mv); c3 = id(bms1_cell3_mv); c4 = id(bms1_cell4_mv); break;
+              case 2: c1 = id(bms2_cell1_mv); c2 = id(bms2_cell2_mv); c3 = id(bms2_cell3_mv); c4 = id(bms2_cell4_mv); break;
+              case 3: c1 = id(bms3_cell1_mv); c2 = id(bms3_cell2_mv); c3 = id(bms3_cell3_mv); c4 = id(bms3_cell4_mv); break;
+              case 4: c1 = id(bms4_cell1_mv); c2 = id(bms4_cell2_mv); c3 = id(bms4_cell3_mv); c4 = id(bms4_cell4_mv); break;
+              case 5: c1 = id(bms5_cell1_mv); c2 = id(bms5_cell2_mv); c3 = id(bms5_cell3_mv); c4 = id(bms5_cell4_mv); break;
+              case 6: c1 = id(bms6_cell1_mv); c2 = id(bms6_cell2_mv); c3 = id(bms6_cell3_mv); c4 = id(bms6_cell4_mv); break;
+              default: return 0;
+            }
+            if (c1 == 0) return 0;
+            uint16_t vmin = c1;
+            if (c2 && c2 < vmin) vmin = c2;
+            if (c3 && c3 < vmin) vmin = c3;
+            if (c4 && c4 < vmin) vmin = c4;
+            return vmin;
+          };
+
           auto slot_cell_temp_c = [&](int slot) -> int16_t {
             switch (slot) {
               case 1: return id(bms1_cell_temp);
@@ -2342,6 +2385,8 @@ script:
           float slots_vmin_mv = 0.0f;
           bool slots_v_init = false;
           float pack_cell_delta_max_mv = 0.0f;
+          uint16_t pack_cell_min_mv = 0;
+          bool pack_cell_min_init = false;
           uint32_t pack_cycle_count_max = 0;
           uint64_t pack_discharged_ah_total = 0;
           int pack_cell_temp_min_c = 0;
@@ -2394,6 +2439,12 @@ script:
               float slot_delta = (float)slot_cell_delta_mv(slot);
               if (slot_delta > pack_cell_delta_max_mv) {
                 pack_cell_delta_max_mv = slot_delta;
+              }
+
+              uint16_t slot_cmin = slot_cell_min_mv(slot);
+              if (slot_cmin > 0 && (!pack_cell_min_init || slot_cmin < pack_cell_min_mv)) {
+                pack_cell_min_mv = slot_cmin;
+                pack_cell_min_init = true;
               }
 
               uint32_t slot_cycles = slot_cycle_count(slot);
@@ -2507,9 +2558,10 @@ script:
           int pack_rssi_quality_pct = pack_rssi_weakest_dbm <= -100 ? 0 : (pack_rssi_weakest_dbm >= -50 ? 100 : (2 * (pack_rssi_weakest_dbm + 100)));
           const char *pack_rssi_quality = pack_rssi_weakest_dbm >= -60 ? "excellent" : (pack_rssi_weakest_dbm >= -70 ? "good" : (pack_rssi_weakest_dbm >= -80 ? "fair" : (pack_rssi_weakest_dbm >= -90 ? "weak" : "very_weak")));
           auto cell_balancer_level = [&](float delta_mv) -> const char * {
-            if (delta_mv <= 10.0f) return "good";
-            if (delta_mv <= 20.0f) return "light";
-            if (delta_mv <= 40.0f) return "warning";
+            if (delta_mv <= 10.0f) return "excellent";
+            if (delta_mv <= 25.0f) return "good";
+            if (delta_mv <= 40.0f) return "normal";
+            if (delta_mv <= 60.0f) return "warning";
             return "critical";
           };
           // HA01 Equalizer works on 12V-pack differences and typically starts balancing around 20 mV.
@@ -2579,6 +2631,7 @@ script:
           publish_value("series_group_voltage_delta_mv", esphome::str_sprintf("%.0f", series_group_voltage_delta_mv));
           publish_value("slot_voltage_delta_mv", esphome::str_sprintf("%.0f", slot_voltage_delta_mv));
           publish_value("pack_cell_delta_max_mv", esphome::str_sprintf("%.0f", pack_cell_delta_max_mv));
+          publish_value("pack_cell_min_mv", esphome::to_string(pack_cell_min_mv));
           publish_value("pack_cell_balancer_status", pack_cell_balancer_status);
           publish_value("pack_series_balancer_status", pack_series_balancer_status);
           publish_value("pack_cycle_count_max", esphome::to_string(pack_cycle_count_max));
