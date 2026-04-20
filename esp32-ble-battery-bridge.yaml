@@ -1,19 +1,20 @@
+# ═══════════════════════════════════════════════════════════════════════
+# SUBSTITUTIONS
+# ═══════════════════════════════════════════════════════════════════════
 substitutions:
+  # ── Gateway & MQTT ────────────────────────────────────────────────────
   gateway_name: esp32-battery-bridge
   gateway_friendly_name: "ESP32 BLE Battery Bridge"
-
-  # Allgemeiner MQTT-Top-Pfad (nicht markenspezifisch)
   mqtt_topic_prefix: ble_battery
   ha_discovery_prefix: homeassistant
 
-  # Batteriesystem fuer Aggregation:
-  # '-' trennt Seriengruppen, Ziffern in einer Gruppe sind parallel.
-  # Beispiele: 123-456 (2 Seriengruppen mit je 3x parallel), 12-34-56 (3S mit je 2P)
+  # ── Battery system for aggregation ────────────────────────────────────
+  # '-' separates series groups; digits within a group are parallel.
+  # Examples: "123-456" = 2S3P, "12-34-56" = 3S2P
   battery_system_name: "Bootsbatterie"
   battery_system_topology: "1-2"
 
-  # Kommunikations-Timeouts/Intervals (alle in ms oder s)
-  # Weak-signal Profil fuer groessere Distanz zur Batterie.
+  # ── Timing & retries (weak-signal profile for longer BLE range) ───────
   ble_connect_timeout: "1800ms"
   ble_read_timeout: "2200ms"
   ble_retry_backoff_delay: "1200ms"
@@ -26,12 +27,10 @@ substitutions:
   watchdog_idle_recover_s: "150"
   watchdog_reboot_after_recoveries: "3"
 
-  # Batterien (PowerQueen/LiTime/Redodo Protokollfamilie)
-  # name = Primärschlüssel für MQTT topics (z.B. "P-12100BNNA70-XXXXXX")
-  # mac = BLE-Adresse (z.B. "XX:XX:XX:XX:XX:XX")
-  # enabled = true/false
-  # Slot ist aktiv, wenn enabled=true und name nicht leer.
-  # Wenn mac leer ist, wird per Scan über den Namen gebunden und persistent gespeichert.
+  # ── Battery slots (bms1–bms6) ─────────────────────────────────────────
+  # name   = MQTT topic key (e.g. "P-12100BNNA70-XXXXXX"); empty = slot inactive
+  # mac    = BLE address; empty = auto-bind by name (stored in NVS flash)
+  # enabled = "true" / "false"  — slot is active when enabled=true AND name is not empty
 
   bms1_name: "P-12100BNNA70-XXXXXX"
   bms1_mac: "XX:XX:XX:XX:XX:XX"
@@ -91,8 +90,7 @@ logger:
     mqtt: WARN
     wifi: WARN
     ble_client: WARN
-    # BLE-Disconnects werden durch das sequenzielle Polling absichtlich erzeugt.
-    # Daher auf ERROR, um Log-Spam zu reduzieren.
+    # BLE disconnects are intentional (sequential polling) — suppress to avoid log spam.
     ble_sensor: ERROR
     esp32_ble_client: WARN
     esp32_ble_tracker: WARN
@@ -138,9 +136,6 @@ ota:
     password: !secret ota_password
 
 mqtt:
-  # mqtt_broker_host in secrets.yaml:
-  # - Hostname/FQDN: mqtt.home.arpa
-  # - Oder direkte IP: 192.168.1.10
   broker: !secret mqtt_broker_host
   port: 1883
   log_topic: null
@@ -162,6 +157,9 @@ time:
       - pool.ntp.org
       - time.nist.gov
 
+# ═══════════════════════════════════════════════════════════════════════
+# GLOBALS — per-slot state variables (restored from NVS where noted)
+# ═══════════════════════════════════════════════════════════════════════
 globals:
   - id: discovery_last_mac
     type: std::string
@@ -854,6 +852,9 @@ globals:
     restore_value: no
     initial_value: '""'
 
+# ═══════════════════════════════════════════════════════════════════════
+# BLE TRACKER — auto-binding: advertised name → MAC → NVS flash
+# ═══════════════════════════════════════════════════════════════════════
 esp32_ble_tracker:
   scan_parameters:
     interval: 1.1s
@@ -899,14 +900,14 @@ esp32_ble_tracker:
               }
 
               if (static_mode && slot_mac != adv_mac) {
-                ESP_LOGW("BIND", "Slot %d (%s): Name passt, MAC stimmt nicht (expected=%s seen=%s)", slot, slot_name.c_str(), slot_mac.c_str(), adv_mac.c_str());
+                ESP_LOGW("BIND", "Slot %d (%s): name match but MAC mismatch (expected=%s seen=%s)", slot, slot_name.c_str(), slot_mac.c_str(), adv_mac.c_str());
               }
               return;
             }
 
             if (mac_match) {
               slot_rssi = x.get_rssi();
-              ESP_LOGW("BIND", "Slot %d (%s): MAC passt, Name stimmt nicht (seen=%s)", slot, slot_name.c_str(), adv_name.c_str());
+              ESP_LOGW("BIND", "Slot %d (%s): MAC match but name mismatch (seen=%s)", slot, slot_name.c_str(), adv_name.c_str());
 
               if (!static_mode) {
                 bound_mac.clear();
@@ -921,6 +922,9 @@ esp32_ble_tracker:
           bind_slot(5, "${bms5_name}", "${bms5_mac}", "${bms5_enabled}", id(bms5_bound_mac), id(bms5_rssi));
           bind_slot(6, "${bms6_name}", "${bms6_mac}", "${bms6_enabled}", id(bms6_bound_mac), id(bms6_rssi));
 
+# ═══════════════════════════════════════════════════════════════════════
+# BLE CLIENTS — one per slot (auto_connect: false — driven by scripts)
+# ═══════════════════════════════════════════════════════════════════════
 ble_client:
   - mac_address: "${bms1_mac}"
     id: bms1_ble_client
@@ -930,8 +934,8 @@ ble_client:
     id: bms2_ble_client
     auto_connect: false
 
-  - # Platzhalter-MAC fuer Compiler; reale Ziel-MAC wird vor connect per set_address(...) gesetzt.
-    # Dadurch sind leere bmsX_mac Substitutions weiterhin moeglich.
+  - # Placeholder MACs for slots 3–6; actual address is set via set_address() before connect,
+    # which allows empty bmsX_mac substitutions.
     mac_address: "00:00:00:00:00:03"
     id: bms3_ble_client
     auto_connect: false
@@ -948,6 +952,9 @@ ble_client:
     id: bms6_ble_client
     auto_connect: false
 
+# ═══════════════════════════════════════════════════════════════════════
+# SENSORS — BLE frame parsers (105-byte frame, little-endian, checksum @ byte 104)
+# ═══════════════════════════════════════════════════════════════════════
 sensor:
   - platform: uptime
     id: gateway_uptime_s
@@ -1052,7 +1059,7 @@ sensor:
       return (float)x.size();
     update_interval: never
 
-  # ===== BMS 2 Parser (identisch) =====
+  # ===== BMS 2 Parser (identical) =====
   - platform: ble_client
     type: characteristic
     id: bms2_raw_notify
@@ -1489,6 +1496,9 @@ sensor:
       return (float)x.size();
     update_interval: never
 
+# ═══════════════════════════════════════════════════════════════════════
+# BINARY & TEXT SENSORS
+# ═══════════════════════════════════════════════════════════════════════
 binary_sensor:
   - platform: template
     id: bms1_connected_status
@@ -1544,8 +1554,11 @@ text_sensor:
       id: gateway_wifi_bssid
       internal: true
 
+# ═══════════════════════════════════════════════════════════════════════
+# SCRIPTS — discovery, status, recovery, per-slot read/publish, HA discovery
+# ═══════════════════════════════════════════════════════════════════════
 script:
-  # ===== DISCOVERY TRIGGER =====
+  # ── Discovery trigger ─────────────────────────────────────────────────
   - id: publish_ha_discovery_if_needed
     then:
       - lambda: |-
@@ -1572,7 +1585,7 @@ script:
             id(publish_ha_discovery).execute();
           }
 
-  # ===== GATEWAY STATUS =====
+  # ── Gateway status ────────────────────────────────────────────────────
   - id: publish_gateway_status
     then:
       - lambda: |-
@@ -1798,7 +1811,7 @@ script:
             id(mqtt_client).publish(base_topic + "raw_frame_hex", id(bms2_last_frame_hex), 0, false);
           }
 
-  # ===== PUBLISH BMS 3-6 (voll) =====
+  # ===== PUBLISH BMS 3–6 =====
   - id: publish_bms3
     then:
       - lambda: |-
@@ -2606,7 +2619,7 @@ script:
           if (ts > 0) {
             id(discovery_last_publish_epoch) = ts;
           } else if (id(discovery_last_publish_epoch) == 0) {
-            // Sentinel fuer "schon gepostet, aber ohne gueltige Uhrzeit".
+            // Sentinel: already published once but without valid time.
             id(discovery_last_publish_epoch) = 1;
           }
           ESP_LOGW("DISCOVERY", "Publishing HA discovery config topics (ts=%u)", ts);
@@ -2627,10 +2640,10 @@ script:
             payload += "\"unique_id\":\"" + node_id + "_" + object_id + "\",";
             payload += "\"state_topic\":\"" + state_topic + "\",";
             payload += "\"device\":{";
-          payload += "\"identifiers\":[\"" + device_id + "\"],";
-          payload += "\"name\":\"" + device_name + "\",";
+            payload += "\"identifiers\":[\"" + device_id + "\"],";
+            payload += "\"name\":\"" + device_name + "\",";
             payload += "\"manufacturer\":\"ESPHome\",";
-          payload += "\"model\":\"" + device_model + "\"";
+            payload += "\"model\":\"" + device_model + "\"";
             payload += "}";
 
             if (!unit.empty()) {
@@ -3069,6 +3082,9 @@ script:
       - lambda: |-
           id(read_cycle_running) = false;
 
+# ═══════════════════════════════════════════════════════════════════════
+# INTERVALS — poll cycle, watchdog, periodic status publish
+# ═══════════════════════════════════════════════════════════════════════
 interval:
   - interval: ${poll_interval}
     then:
@@ -3130,6 +3146,9 @@ interval:
           then:
             - script.execute: publish_gateway_status
 
+# ═══════════════════════════════════════════════════════════════════════
+# SWITCH — manual read trigger
+# ═══════════════════════════════════════════════════════════════════════
 switch:
   - platform: template
     name: "Read All Batteries (Manual)"
