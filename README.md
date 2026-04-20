@@ -162,6 +162,8 @@ To remove stale entities: delete the retained discovery config topics in an MQTT
 | ≤ 120 mV | `warning` |
 | > 120 mV | `critical` |
 
+<img width="1614" height="441" alt="image" src="https://github.com/user-attachments/assets/8a40e865-6641-434d-8f8d-a06e20015521" />
+
 ### Parser Fallback Rules
 
 - `cycle_count`: primary `u32@96`; falls back to `u16@66` if primary is 0 or ≥ 1,000,000
