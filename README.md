@@ -8,9 +8,8 @@ ESPHome-based BLE gateway for LiTime, PowerQueen, and Redodo BMS devices. Reads 
 
 1. Open ESPHome dashboard (Home Assistant add-on or standalone).
 2. Create a new node, paste `esp32-ble-battery-bridge.yaml`.
-3. Fill in `secrets.yaml` with required credentials.
-4. Set battery slots in the `substitutions` section.
-5. Validate, compile, and flash.
+3. Fill in `secrets.yaml` with WiFi, MQTT, and battery slot values (see below).
+4. Validate, compile, and flash.
 
 ## Required Secrets
 
@@ -23,16 +22,52 @@ ESPHome-based BLE gateway for LiTime, PowerQueen, and Redodo BMS devices. Reads 
 | `mqtt_username` / `mqtt_password` | MQTT credentials |
 | `ota_password` | OTA update password |
 | `api_encryption_key` | ESPHome API key |
+| `bms1_name` … `bms6_name` | Battery name (MQTT topic key); leave empty to disable slot |
+| `bms1_mac` … `bms6_mac` | BLE MAC address; leave empty to auto-bind by name |
 
 ## Slot Configuration
 
-Six slots (`bms1`–`bms6`) are configured in the `substitutions` block:
+Six slots (`bms1`–`bms6`) are available. By default, only `bms1` and `bms2` are wired to `secrets.yaml`. Slots 3–6 are disabled with empty string defaults directly in the substitutions block.
+
+### Active slots (bms1 / bms2)
+
+Values come from `secrets.yaml` (gitignored — never committed):
 
 ```yaml
-bms1_name:    "P-12100BNNA70-XXXXXX"   # MQTT topic key; empty = slot inactive
-bms1_mac:     "XX:XX:XX:XX:XX:XX"      # BLE address; empty = auto-bind by name
-bms1_enabled: "true"
+# secrets.yaml
+bms1_name: "P-12100BNNA70-XXXXXX"   # MQTT topic key; empty = slot inactive
+bms1_mac:  "XX:XX:XX:XX:XX:XX"      # BLE address; empty = auto-bind by name
+
+bms2_name: "L-12100BNNA70-XXXXXX"
+bms2_mac:  "XX:XX:XX:XX:XX:XX"
 ```
+
+### Inactive slots (bms3–bms6)
+
+These have hardcoded empty strings in `esp32-ble-battery-bridge.yaml` and are always disabled unless you explicitly activate them:
+
+```yaml
+# esp32-ble-battery-bridge.yaml — substitutions block
+bms3_name: ""      ← disabled by default
+bms3_mac:  ""
+bms3_enabled: "false"
+```
+
+### Activating an additional slot
+
+ESPHome has no optional-secret fallback — a missing `!secret` key is a compile error. To activate e.g. slot 3:
+
+1. Add values to `secrets.yaml`:
+   ```yaml
+   bms3_name: "P-12100BNNA70-XXXXXX"
+   bms3_mac:  "XX:XX:XX:XX:XX:XX"
+   ```
+2. Change two lines in the `substitutions` block of the main YAML:
+   ```yaml
+   bms3_name: !secret bms3_name   # was: ""
+   bms3_mac:  !secret bms3_mac    # was: ""
+   bms3_enabled: "true"           # was: "false"
+   ```
 
 A slot is active when `enabled: "true"` **and** `name` is not empty.
 
