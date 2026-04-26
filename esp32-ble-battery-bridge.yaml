@@ -185,6 +185,10 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
+  - id: victron_balancer_alarm_latched
+    type: bool
+    restore_value: no
+    initial_value: "false"
 
   # ===== BMS 1 =====
   - id: bms1_frame_received
@@ -1686,10 +1690,10 @@ script:
           publish_value("rssi", esphome::to_string(rssi));
           publish_value("rssi_quality_pct", esphome::to_string(rssi_quality_pct));
           publish_value("rssi_quality", rssi_quality);
-          publish_value("voltage_mv", esphome::to_string(id(bms1_voltage_mv)));
-          publish_value("current_ma", esphome::to_string(id(bms1_current_ma)));
+          publish_value("voltage_v", esphome::str_sprintf("%.3f", id(bms1_voltage_mv) / 1000.0f));
+          publish_value("current_a", esphome::str_sprintf("%.3f", id(bms1_current_ma) / 1000.0f));
           publish_value("power_w", esphome::str_sprintf("%.3f", power_w));
-          publish_value("pack_voltage_mv", esphome::to_string(id(bms1_pack_voltage_mv)));
+          publish_value("pack_voltage_v", esphome::str_sprintf("%.3f", id(bms1_pack_voltage_mv) / 1000.0f));
           publish_value("remain_ah", esphome::to_string(id(bms1_remain_ah)));
           publish_value("factory_ah", esphome::to_string(id(bms1_factory_ah)));
           publish_value("cell_temp", esphome::to_string((int)id(bms1_cell_temp)));
@@ -1715,7 +1719,7 @@ script:
           publish_value("equil_cell", bms1_equil_cell.empty() ? "none" : bms1_equil_cell);
           publish_value("protect_state", esphome::to_string(id(bms1_protect_state)));
           publish_value("discharge_switch", id(bms1_discharge_off) ? "OFF" : "ON");
-          const char *bms1_operating_mode = id(bms1_operating_mode_raw) == 0 ? "idle" : (id(bms1_operating_mode_raw) == 1 ? "charge" : (id(bms1_operating_mode_raw) == 2 ? "discharge" : "unknown"));
+          const char *bms1_operating_mode = id(bms1_operating_mode_raw) == 0 ? "idle" : (id(bms1_operating_mode_raw) == 1 ? "charge" : (id(bms1_operating_mode_raw) == 2 ? "discharge" : (id(bms1_operating_mode_raw) == 4 ? "voltage_protection" : "unknown")));
           publish_value("operating_mode_raw", esphome::to_string(id(bms1_operating_mode_raw)));
           publish_value("operating_mode", bms1_operating_mode);
           if (id(bms1_discharge_off)) {
@@ -1773,10 +1777,10 @@ script:
           publish_value("rssi", esphome::to_string(rssi));
           publish_value("rssi_quality_pct", esphome::to_string(rssi_quality_pct));
           publish_value("rssi_quality", rssi_quality);
-          publish_value("voltage_mv", esphome::to_string(id(bms2_voltage_mv)));
-          publish_value("current_ma", esphome::to_string(id(bms2_current_ma)));
+          publish_value("voltage_v", esphome::str_sprintf("%.3f", id(bms2_voltage_mv) / 1000.0f));
+          publish_value("current_a", esphome::str_sprintf("%.3f", id(bms2_current_ma) / 1000.0f));
           publish_value("power_w", esphome::str_sprintf("%.3f", power_w));
-          publish_value("pack_voltage_mv", esphome::to_string(id(bms2_pack_voltage_mv)));
+          publish_value("pack_voltage_v", esphome::str_sprintf("%.3f", id(bms2_pack_voltage_mv) / 1000.0f));
           publish_value("remain_ah", esphome::to_string(id(bms2_remain_ah)));
           publish_value("factory_ah", esphome::to_string(id(bms2_factory_ah)));
           publish_value("cell_temp", esphome::to_string((int)id(bms2_cell_temp)));
@@ -1802,7 +1806,7 @@ script:
           publish_value("equil_cell", bms2_equil_cell.empty() ? "none" : bms2_equil_cell);
           publish_value("protect_state", esphome::to_string(id(bms2_protect_state)));
           publish_value("discharge_switch", id(bms2_discharge_off) ? "OFF" : "ON");
-          const char *bms2_operating_mode = id(bms2_operating_mode_raw) == 0 ? "idle" : (id(bms2_operating_mode_raw) == 1 ? "charge" : (id(bms2_operating_mode_raw) == 2 ? "discharge" : "unknown"));
+          const char *bms2_operating_mode = id(bms2_operating_mode_raw) == 0 ? "idle" : (id(bms2_operating_mode_raw) == 1 ? "charge" : (id(bms2_operating_mode_raw) == 2 ? "discharge" : (id(bms2_operating_mode_raw) == 4 ? "voltage_protection" : "unknown")));
           publish_value("operating_mode_raw", esphome::to_string(id(bms2_operating_mode_raw)));
           publish_value("operating_mode", bms2_operating_mode);
           if (id(bms2_discharge_off)) {
@@ -1860,10 +1864,10 @@ script:
           publish_value("rssi", esphome::to_string(rssi));
           publish_value("rssi_quality_pct", esphome::to_string(rssi_quality_pct));
           publish_value("rssi_quality", rssi_quality);
-          publish_value("voltage_mv", esphome::to_string(id(bms3_voltage_mv)));
-          publish_value("current_ma", esphome::to_string(id(bms3_current_ma)));
+          publish_value("voltage_v", esphome::str_sprintf("%.3f", id(bms3_voltage_mv) / 1000.0f));
+          publish_value("current_a", esphome::str_sprintf("%.3f", id(bms3_current_ma) / 1000.0f));
           publish_value("power_w", esphome::str_sprintf("%.3f", power_w));
-          publish_value("pack_voltage_mv", esphome::to_string(id(bms3_pack_voltage_mv)));
+          publish_value("pack_voltage_v", esphome::str_sprintf("%.3f", id(bms3_pack_voltage_mv) / 1000.0f));
           publish_value("remain_ah", esphome::to_string(id(bms3_remain_ah)));
           publish_value("factory_ah", esphome::to_string(id(bms3_factory_ah)));
           publish_value("cell_temp", esphome::to_string((int)id(bms3_cell_temp)));
@@ -1889,7 +1893,7 @@ script:
           publish_value("equil_cell", bms3_equil_cell.empty() ? "none" : bms3_equil_cell);
           publish_value("protect_state", esphome::to_string(id(bms3_protect_state)));
           publish_value("discharge_switch", id(bms3_discharge_off) ? "OFF" : "ON");
-          const char *bms3_operating_mode = id(bms3_operating_mode_raw) == 0 ? "idle" : (id(bms3_operating_mode_raw) == 1 ? "charge" : (id(bms3_operating_mode_raw) == 2 ? "discharge" : "unknown"));
+          const char *bms3_operating_mode = id(bms3_operating_mode_raw) == 0 ? "idle" : (id(bms3_operating_mode_raw) == 1 ? "charge" : (id(bms3_operating_mode_raw) == 2 ? "discharge" : (id(bms3_operating_mode_raw) == 4 ? "voltage_protection" : "unknown")));
           publish_value("operating_mode_raw", esphome::to_string(id(bms3_operating_mode_raw)));
           publish_value("operating_mode", bms3_operating_mode);
           if (id(bms3_discharge_off)) {
@@ -1946,10 +1950,10 @@ script:
           publish_value("rssi", esphome::to_string(rssi));
           publish_value("rssi_quality_pct", esphome::to_string(rssi_quality_pct));
           publish_value("rssi_quality", rssi_quality);
-          publish_value("voltage_mv", esphome::to_string(id(bms4_voltage_mv)));
-          publish_value("current_ma", esphome::to_string(id(bms4_current_ma)));
+          publish_value("voltage_v", esphome::str_sprintf("%.3f", id(bms4_voltage_mv) / 1000.0f));
+          publish_value("current_a", esphome::str_sprintf("%.3f", id(bms4_current_ma) / 1000.0f));
           publish_value("power_w", esphome::str_sprintf("%.3f", power_w));
-          publish_value("pack_voltage_mv", esphome::to_string(id(bms4_pack_voltage_mv)));
+          publish_value("pack_voltage_v", esphome::str_sprintf("%.3f", id(bms4_pack_voltage_mv) / 1000.0f));
           publish_value("remain_ah", esphome::to_string(id(bms4_remain_ah)));
           publish_value("factory_ah", esphome::to_string(id(bms4_factory_ah)));
           publish_value("cell_temp", esphome::to_string((int)id(bms4_cell_temp)));
@@ -1975,7 +1979,7 @@ script:
           publish_value("equil_cell", bms4_equil_cell.empty() ? "none" : bms4_equil_cell);
           publish_value("protect_state", esphome::to_string(id(bms4_protect_state)));
           publish_value("discharge_switch", id(bms4_discharge_off) ? "OFF" : "ON");
-          const char *bms4_operating_mode = id(bms4_operating_mode_raw) == 0 ? "idle" : (id(bms4_operating_mode_raw) == 1 ? "charge" : (id(bms4_operating_mode_raw) == 2 ? "discharge" : "unknown"));
+          const char *bms4_operating_mode = id(bms4_operating_mode_raw) == 0 ? "idle" : (id(bms4_operating_mode_raw) == 1 ? "charge" : (id(bms4_operating_mode_raw) == 2 ? "discharge" : (id(bms4_operating_mode_raw) == 4 ? "voltage_protection" : "unknown")));
           publish_value("operating_mode_raw", esphome::to_string(id(bms4_operating_mode_raw)));
           publish_value("operating_mode", bms4_operating_mode);
           if (id(bms4_discharge_off)) {
@@ -2032,10 +2036,10 @@ script:
           publish_value("rssi", esphome::to_string(rssi));
           publish_value("rssi_quality_pct", esphome::to_string(rssi_quality_pct));
           publish_value("rssi_quality", rssi_quality);
-          publish_value("voltage_mv", esphome::to_string(id(bms5_voltage_mv)));
-          publish_value("current_ma", esphome::to_string(id(bms5_current_ma)));
+          publish_value("voltage_v", esphome::str_sprintf("%.3f", id(bms5_voltage_mv) / 1000.0f));
+          publish_value("current_a", esphome::str_sprintf("%.3f", id(bms5_current_ma) / 1000.0f));
           publish_value("power_w", esphome::str_sprintf("%.3f", power_w));
-          publish_value("pack_voltage_mv", esphome::to_string(id(bms5_pack_voltage_mv)));
+          publish_value("pack_voltage_v", esphome::str_sprintf("%.3f", id(bms5_pack_voltage_mv) / 1000.0f));
           publish_value("remain_ah", esphome::to_string(id(bms5_remain_ah)));
           publish_value("factory_ah", esphome::to_string(id(bms5_factory_ah)));
           publish_value("cell_temp", esphome::to_string((int)id(bms5_cell_temp)));
@@ -2061,7 +2065,7 @@ script:
           publish_value("equil_cell", bms5_equil_cell.empty() ? "none" : bms5_equil_cell);
           publish_value("protect_state", esphome::to_string(id(bms5_protect_state)));
           publish_value("discharge_switch", id(bms5_discharge_off) ? "OFF" : "ON");
-          const char *bms5_operating_mode = id(bms5_operating_mode_raw) == 0 ? "idle" : (id(bms5_operating_mode_raw) == 1 ? "charge" : (id(bms5_operating_mode_raw) == 2 ? "discharge" : "unknown"));
+          const char *bms5_operating_mode = id(bms5_operating_mode_raw) == 0 ? "idle" : (id(bms5_operating_mode_raw) == 1 ? "charge" : (id(bms5_operating_mode_raw) == 2 ? "discharge" : (id(bms5_operating_mode_raw) == 4 ? "voltage_protection" : "unknown")));
           publish_value("operating_mode_raw", esphome::to_string(id(bms5_operating_mode_raw)));
           publish_value("operating_mode", bms5_operating_mode);
           if (id(bms5_discharge_off)) {
@@ -2118,10 +2122,10 @@ script:
           publish_value("rssi", esphome::to_string(rssi));
           publish_value("rssi_quality_pct", esphome::to_string(rssi_quality_pct));
           publish_value("rssi_quality", rssi_quality);
-          publish_value("voltage_mv", esphome::to_string(id(bms6_voltage_mv)));
-          publish_value("current_ma", esphome::to_string(id(bms6_current_ma)));
+          publish_value("voltage_v", esphome::str_sprintf("%.3f", id(bms6_voltage_mv) / 1000.0f));
+          publish_value("current_a", esphome::str_sprintf("%.3f", id(bms6_current_ma) / 1000.0f));
           publish_value("power_w", esphome::str_sprintf("%.3f", power_w));
-          publish_value("pack_voltage_mv", esphome::to_string(id(bms6_pack_voltage_mv)));
+          publish_value("pack_voltage_v", esphome::str_sprintf("%.3f", id(bms6_pack_voltage_mv) / 1000.0f));
           publish_value("remain_ah", esphome::to_string(id(bms6_remain_ah)));
           publish_value("factory_ah", esphome::to_string(id(bms6_factory_ah)));
           publish_value("cell_temp", esphome::to_string((int)id(bms6_cell_temp)));
@@ -2147,7 +2151,7 @@ script:
           publish_value("equil_cell", bms6_equil_cell.empty() ? "none" : bms6_equil_cell);
           publish_value("protect_state", esphome::to_string(id(bms6_protect_state)));
           publish_value("discharge_switch", id(bms6_discharge_off) ? "OFF" : "ON");
-          const char *bms6_operating_mode = id(bms6_operating_mode_raw) == 0 ? "idle" : (id(bms6_operating_mode_raw) == 1 ? "charge" : (id(bms6_operating_mode_raw) == 2 ? "discharge" : "unknown"));
+          const char *bms6_operating_mode = id(bms6_operating_mode_raw) == 0 ? "idle" : (id(bms6_operating_mode_raw) == 1 ? "charge" : (id(bms6_operating_mode_raw) == 2 ? "discharge" : (id(bms6_operating_mode_raw) == 4 ? "voltage_protection" : "unknown")));
           publish_value("operating_mode_raw", esphome::to_string(id(bms6_operating_mode_raw)));
           publish_value("operating_mode", bms6_operating_mode);
           if (id(bms6_discharge_off)) {
@@ -2174,6 +2178,7 @@ script:
           struct GroupAgg {
             std::vector<int> slots;
             float voltage_mv = 0.0f;
+            float internal_voltage_mv = 0.0f;
             float current_ma = 0.0f;
             float capacity_ah = 0.0f;
             float remain_ah = 0.0f;
@@ -2200,6 +2205,18 @@ script:
               case 4: return id(bms4_voltage_mv);
               case 5: return id(bms5_voltage_mv);
               case 6: return id(bms6_voltage_mv);
+              default: return 0;
+            }
+          };
+
+          auto slot_internal_voltage_mv = [&](int slot) -> uint16_t {
+            switch (slot) {
+              case 1: return id(bms1_pack_voltage_mv);
+              case 2: return id(bms2_pack_voltage_mv);
+              case 3: return id(bms3_pack_voltage_mv);
+              case 4: return id(bms4_pack_voltage_mv);
+              case 5: return id(bms5_pack_voltage_mv);
+              case 6: return id(bms6_pack_voltage_mv);
               default: return 0;
             }
           };
@@ -2345,6 +2362,18 @@ script:
             }
           };
 
+          auto slot_operating_mode_raw = [&](int slot) -> uint16_t {
+            switch (slot) {
+              case 1: return id(bms1_operating_mode_raw);
+              case 2: return id(bms2_operating_mode_raw);
+              case 3: return id(bms3_operating_mode_raw);
+              case 4: return id(bms4_operating_mode_raw);
+              case 5: return id(bms5_operating_mode_raw);
+              case 6: return id(bms6_operating_mode_raw);
+              default: return 0;
+            }
+          };
+
           std::vector<GroupAgg> groups;
           GroupAgg current_group;
           bool used_slot[7] = {false, false, false, false, false, false, false};
@@ -2394,10 +2423,13 @@ script:
           int pack_mosfet_temp_min_c = 0;
           int pack_mosfet_temp_max_c = 0;
           bool pack_temp_init = false;
+          uint16_t pack_operating_mode_raw = 0;
 
           for (auto &g : groups) {
             float group_voltage_sum = 0.0f;
             int group_voltage_count = 0;
+            float group_internal_voltage_sum = 0.0f;
+            int group_internal_voltage_count = 0;
             float group_current_sum = 0.0f;
             float group_capacity_sum = 0.0f;
             float group_remain_sum = 0.0f;
@@ -2416,9 +2448,17 @@ script:
               active_slots++;
               group_voltage_sum += (float)vmv;
               group_voltage_count++;
+              uint16_t ivmv = slot_internal_voltage_mv(slot);
+              if (ivmv > 0) {
+                group_internal_voltage_sum += (float)ivmv;
+                group_internal_voltage_count++;
+              }
               group_current_sum += (float)slot_current_ma(slot);
               group_capacity_sum += cah;
               group_remain_sum += slot_remain_ah(slot);
+
+              uint16_t slot_op = slot_operating_mode_raw(slot);
+              if (slot_op > pack_operating_mode_raw) pack_operating_mode_raw = slot_op;
 
               if (!pack_rssi_init) {
                 pack_rssi_weakest_dbm = slot_rssi(slot);
@@ -2472,12 +2512,16 @@ script:
             if (group_voltage_count == 0) {
               topology_valid = false;
               g.voltage_mv = 0.0f;
+              g.internal_voltage_mv = 0.0f;
               g.current_ma = 0.0f;
               g.capacity_ah = 0.0f;
               g.remain_ah = 0.0f;
               g.contributing = 0;
             } else {
               g.voltage_mv = group_voltage_sum / (float)group_voltage_count;
+              g.internal_voltage_mv = group_internal_voltage_count > 0
+                  ? group_internal_voltage_sum / (float)group_internal_voltage_count
+                  : 0.0f;
               g.current_ma = group_current_sum;
               g.capacity_ah = group_capacity_sum;
               g.remain_ah = group_remain_sum;
@@ -2486,6 +2530,7 @@ script:
           }
 
           float pack_voltage_mv = 0.0f;
+          float pack_voltage_internal_mv = 0.0f;
           float pack_current_ma = 0.0f;
           float pack_capacity_ah = 0.0f;
           float pack_remain_ah = 0.0f;
@@ -2511,6 +2556,7 @@ script:
               }
               valid_groups++;
               pack_voltage_mv += g.voltage_mv;
+              pack_voltage_internal_mv += g.internal_voltage_mv;
               current_sum += g.current_ma;
 
               if (!group_v_init) {
@@ -2574,6 +2620,39 @@ script:
           const char *pack_cell_balancer_status = cell_balancer_level(pack_cell_delta_max_mv);
           const char *pack_series_balancer_status = pack_series_balancer_level(series_group_voltage_delta_mv);
 
+          const char *pack_operating_mode = pack_operating_mode_raw == 0 ? "idle" :
+                                            pack_operating_mode_raw == 1 ? "charge" :
+                                            pack_operating_mode_raw == 2 ? "discharge" :
+                                            pack_operating_mode_raw == 4 ? "voltage_protection" :
+                                            "unknown";
+
+          // Victron Battery Balancer (24 V) — thresholds from Victron product page.
+          constexpr float VICTRON_ACTIVATION_V = 27.3f;
+          constexpr float VICTRON_ALARM_ON_MV  = 200.0f;
+          constexpr float VICTRON_ALARM_OFF_MV = 140.0f;
+          constexpr float VICTRON_LOW_RESET_V  = 26.6f;
+
+          const float pack_voltage_v_local = pack_voltage_mv / 1000.0f;
+          const bool victron_in_range = (groups.size() == 2 && topology_valid);
+          const bool victron_active = victron_in_range && pack_voltage_v_local > VICTRON_ACTIVATION_V;
+
+          bool victron_alarm = id(victron_balancer_alarm_latched);
+          if (victron_in_range) {
+            if (series_group_voltage_delta_mv > VICTRON_ALARM_ON_MV) victron_alarm = true;
+            if (series_group_voltage_delta_mv < VICTRON_ALARM_OFF_MV ||
+                pack_voltage_v_local < VICTRON_LOW_RESET_V) victron_alarm = false;
+          } else {
+            victron_alarm = false;
+          }
+          id(victron_balancer_alarm_latched) = victron_alarm;
+
+          const char *victron_balancer_status =
+              !victron_in_range ? "n/a" :
+              !victron_active   ? "below_activation" :
+              victron_alarm     ? "alarm" :
+              series_group_voltage_delta_mv > 50.0f ? "balancing_active" :
+              "balancing_idle";
+
           auto now = id(sntp_time).now();
           uint32_t ts = now.is_valid() ? (uint32_t) now.timestamp : 0;
 
@@ -2592,11 +2671,11 @@ script:
             }
 
             group_parts += esphome::str_sprintf(
-              "{\"index\":%u,\"slots\":[%s],\"voltage_mv\":%.0f,\"current_ma\":%.0f,\"capacity_ah\":%.0f,\"contributors\":%d}",
+              "{\"index\":%u,\"slots\":[%s],\"voltage_v\":%.3f,\"current_a\":%.3f,\"capacity_ah\":%.0f,\"contributors\":%d}",
               (unsigned int) (gi + 1),
               slots_json.c_str(),
-              groups[gi].voltage_mv,
-              groups[gi].current_ma,
+              groups[gi].voltage_mv / 1000.0f,
+              groups[gi].current_ma / 1000.0f,
               groups[gi].capacity_ah,
               groups[gi].contributing
             );
@@ -2615,8 +2694,9 @@ script:
           publish_value("active_slots", esphome::to_string(active_slots));
           publish_value("expected_slots", esphome::to_string(expected_slots));
           publish_value("topology_reporting", esphome::to_string(active_slots) + "/" + esphome::to_string(expected_slots));
-          publish_value("pack_voltage_mv", esphome::str_sprintf("%.0f", pack_voltage_mv));
-          publish_value("pack_current_ma", esphome::str_sprintf("%.0f", pack_current_ma));
+          publish_value("pack_voltage_v", esphome::str_sprintf("%.3f", pack_voltage_mv / 1000.0f));
+          publish_value("pack_voltage_internal_v", esphome::str_sprintf("%.3f", pack_voltage_internal_mv / 1000.0f));
+          publish_value("pack_current_a", esphome::str_sprintf("%.3f", pack_current_ma / 1000.0f));
           publish_value("pack_capacity_ah", esphome::str_sprintf("%.0f", pack_capacity_ah));
           publish_value("pack_remain_ah", esphome::str_sprintf("%.0f", pack_remain_ah));
           publish_value("pack_soc", esphome::str_sprintf("%.1f", pack_soc));
@@ -2634,6 +2714,11 @@ script:
           publish_value("pack_cell_min_mv", esphome::to_string(pack_cell_min_mv));
           publish_value("pack_cell_balancer_status", pack_cell_balancer_status);
           publish_value("pack_series_balancer_status", pack_series_balancer_status);
+          publish_value("operating_mode_raw", esphome::to_string(pack_operating_mode_raw));
+          publish_value("operating_mode", pack_operating_mode);
+          publish_value("victron_balancer_active", victron_active ? "true" : "false");
+          publish_value("victron_balancer_alarm", victron_alarm ? "true" : "false");
+          publish_value("victron_balancer_status", victron_balancer_status);
           publish_value("pack_cycle_count_max", esphome::to_string(pack_cycle_count_max));
           publish_value("pack_discharged_ah_total", esphome::to_string((uint32_t) pack_discharged_ah_total));
           publish_value("groups_json", "[" + group_parts + "]");
@@ -2650,8 +2735,8 @@ script:
             }
 
             id(mqtt_client).publish(gbase + "slots", slots_csv, 0, false);
-            id(mqtt_client).publish(gbase + "voltage_mv", esphome::str_sprintf("%.0f", groups[gi].voltage_mv), 0, false);
-            id(mqtt_client).publish(gbase + "current_ma", esphome::str_sprintf("%.0f", groups[gi].current_ma), 0, false);
+            id(mqtt_client).publish(gbase + "voltage_v", esphome::str_sprintf("%.3f", groups[gi].voltage_mv / 1000.0f), 0, false);
+            id(mqtt_client).publish(gbase + "current_a", esphome::str_sprintf("%.3f", groups[gi].current_ma / 1000.0f), 0, false);
             id(mqtt_client).publish(gbase + "capacity_ah", esphome::str_sprintf("%.0f", groups[gi].capacity_ah), 0, false);
             id(mqtt_client).publish(gbase + "remain_ah", esphome::str_sprintf("%.0f", groups[gi].remain_ah), 0, false);
             id(mqtt_client).publish(gbase + "contributors", esphome::to_string(groups[gi].contributing), 0, false);
@@ -2792,10 +2877,10 @@ script:
             publish_sensor(slot_tag + "_rssi", "RSSI", state_base + "rssi", dev_id, dev_name, dev_model, "dBm", "signal_strength", "measurement", "mdi:wifi");
             publish_sensor(slot_tag + "_rssi_quality_pct", "RSSI Quality", state_base + "rssi_quality_pct", dev_id, dev_name, dev_model, "%", "", "measurement", "mdi:wifi");
             publish_sensor(slot_tag + "_rssi_quality", "RSSI Quality Label", state_base + "rssi_quality", dev_id, dev_name, dev_model, "", "", "", "mdi:wifi");
-            publish_sensor(slot_tag + "_voltage_mv", "Voltage", state_base + "voltage_mv", dev_id, dev_name, dev_model, "mV", "voltage", "measurement", "mdi:sine-wave");
-            publish_sensor(slot_tag + "_current_ma", "Current", state_base + "current_ma", dev_id, dev_name, dev_model, "mA", "current", "measurement", "mdi:current-dc");
+            publish_sensor(slot_tag + "_voltage_v", "Voltage", state_base + "voltage_v", dev_id, dev_name, dev_model, "V", "voltage", "measurement", "mdi:sine-wave");
+            publish_sensor(slot_tag + "_current_a", "Current", state_base + "current_a", dev_id, dev_name, dev_model, "A", "current", "measurement", "mdi:current-dc");
             publish_sensor(slot_tag + "_power_w", "Power", state_base + "power_w", dev_id, dev_name, dev_model, "W", "power", "measurement", "mdi:flash");
-            publish_sensor(slot_tag + "_pack_voltage_mv", "Pack Voltage", state_base + "pack_voltage_mv", dev_id, dev_name, dev_model, "mV", "voltage", "measurement", "mdi:car-battery");
+            publish_sensor(slot_tag + "_pack_voltage_v", "Pack Voltage", state_base + "pack_voltage_v", dev_id, dev_name, dev_model, "V", "voltage", "measurement", "mdi:car-battery");
             publish_sensor(slot_tag + "_remain_ah", "Remaining Capacity", state_base + "remain_ah", dev_id, dev_name, dev_model, "Ah", "", "measurement", "mdi:battery-medium");
             publish_sensor(slot_tag + "_factory_ah", "Nominal Capacity", state_base + "factory_ah", dev_id, dev_name, dev_model, "Ah", "", "measurement", "mdi:battery");
             publish_sensor(slot_tag + "_cell_temp", "Cell Temperature", state_base + "cell_temp", dev_id, dev_name, dev_model, "°C", "temperature", "measurement", "mdi:thermometer");
@@ -2833,8 +2918,9 @@ script:
 
           publish_epoch_timestamp_sensor("pack_timestamp", "Last Update", pack_base + "timestamp", pack_dev_id, pack_dev_name, pack_dev_model, "mdi:clock-outline");
           publish_sensor("pack_power_w", "Pack Power", pack_base + "pack_power_w", pack_dev_id, pack_dev_name, pack_dev_model, "W", "power", "measurement", "mdi:home-lightning-bolt");
-          publish_sensor("pack_voltage_mv", "Pack Voltage", pack_base + "pack_voltage_mv", pack_dev_id, pack_dev_name, pack_dev_model, "mV", "voltage", "measurement", "mdi:sine-wave");
-          publish_sensor("pack_current_ma", "Pack Current", pack_base + "pack_current_ma", pack_dev_id, pack_dev_name, pack_dev_model, "mA", "current", "measurement", "mdi:current-dc");
+          publish_sensor("pack_voltage_v", "Pack Voltage", pack_base + "pack_voltage_v", pack_dev_id, pack_dev_name, pack_dev_model, "V", "voltage", "measurement", "mdi:sine-wave");
+          publish_sensor("pack_voltage_internal_v", "Pack Voltage (Internal)", pack_base + "pack_voltage_internal_v", pack_dev_id, pack_dev_name, pack_dev_model, "V", "voltage", "measurement", "mdi:battery-outline");
+          publish_sensor("pack_current_a", "Pack Current", pack_base + "pack_current_a", pack_dev_id, pack_dev_name, pack_dev_model, "A", "current", "measurement", "mdi:current-dc");
           publish_sensor("pack_capacity_ah", "Pack Capacity", pack_base + "pack_capacity_ah", pack_dev_id, pack_dev_name, pack_dev_model, "Ah", "", "measurement", "mdi:battery");
           publish_sensor("pack_remain_ah", "Remaining Capacity", pack_base + "pack_remain_ah", pack_dev_id, pack_dev_name, pack_dev_model, "Ah", "", "measurement", "mdi:battery-medium");
           publish_sensor("pack_soc", "Pack State of Charge", pack_base + "pack_soc", pack_dev_id, pack_dev_name, pack_dev_model, "%", "battery", "measurement", "mdi:battery-heart-variant");
@@ -2850,6 +2936,11 @@ script:
           publish_sensor("pack_cell_delta_max_mv", "Max Cell Voltage Delta", pack_base + "pack_cell_delta_max_mv", pack_dev_id, pack_dev_name, pack_dev_model, "mV", "", "measurement", "mdi:battery-sync");
           publish_sensor("pack_cell_balancer_status", "Cell Voltage Delta Status", pack_base + "pack_cell_balancer_status", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "", "mdi:scale-balance");
           publish_sensor("pack_series_balancer_status", "Series Group Voltage Delta Status", pack_base + "pack_series_balancer_status", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "", "mdi:scale-balance");
+          publish_sensor("pack_operating_mode_raw", "Pack Operating Mode Raw", pack_base + "operating_mode_raw", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "", "mdi:code-tags");
+          publish_sensor("pack_operating_mode", "Pack Operating Mode", pack_base + "operating_mode", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "", "mdi:engine-outline");
+          publish_binary_sensor("victron_balancer_active", "Victron Balancer Active", pack_base + "victron_balancer_active", pack_dev_id, pack_dev_name, pack_dev_model, "true", "false", "", "mdi:scale-balance");
+          publish_binary_sensor("victron_balancer_alarm", "Victron Balancer Alarm", pack_base + "victron_balancer_alarm", pack_dev_id, pack_dev_name, pack_dev_model, "true", "false", "problem", "mdi:alarm-light");
+          publish_sensor("victron_balancer_status", "Victron Balancer Status", pack_base + "victron_balancer_status", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "", "mdi:state-machine");
           publish_sensor("pack_cycle_count_max", "Pack Max Cycle Count", pack_base + "pack_cycle_count_max", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "measurement", "mdi:counter");
           publish_sensor("pack_discharged_ah_total", "Pack Discharged Capacity Total", pack_base + "pack_discharged_ah_total", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "total_increasing", "mdi:battery-arrow-down-outline");
           publish_sensor("active_slots", "Batteries Reporting", pack_base + "active_slots", pack_dev_id, pack_dev_name, pack_dev_model, "", "", "measurement", "mdi:counter");

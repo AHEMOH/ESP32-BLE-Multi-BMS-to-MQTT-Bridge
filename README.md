@@ -62,12 +62,14 @@ Digits within one group are parallel; `-` separates series groups.
 
 Base prefix: `ble_battery` (configurable via `mqtt_topic_prefix`).
 
+**Unit convention:** whole-battery voltages and pack voltages in **V**; battery and pack currents in **A**; cell voltages and any delta/spread in **mV**.
+
 **Per battery** (`ble_battery/<battery_name>/`):
 
 | Topic | Description |
 |-------|-------------|
-| `voltage_mv`, `current_ma`, `power_w` | Electrical state |
-| `pack_voltage_mv` | Secondary voltage reading |
+| `voltage_v`, `current_a`, `power_w` | Electrical state (terminal/pole voltage) |
+| `pack_voltage_v` | BMS-internal cell-sum voltage (drops to ~0 when discharge MOSFET is off) |
 | `soc`, `soh` | State of charge / health (%) |
 | `cell1_mv`–`cell4_mv` | Per-cell voltages |
 | `cell_min_mv`, `cell_max_mv` | Weakest / strongest cell voltage |
@@ -77,14 +79,17 @@ Base prefix: `ble_battery` (configurable via `mqtt_topic_prefix`).
 | `remain_ah`, `factory_ah` | Remaining / nominal capacity |
 | `discharge_switch` | `ON` / `OFF` (derived from status_flags bit 0x80) |
 | `equil_state`, `equil_cell` | Balancer state; cell names as CSV e.g. `cell1,cell3` |
-| `protect_state`, `operating_mode` | Protection / mode status |
+| `protect_state` | Protection-state code (raw integer) |
+| `operating_mode_raw`, `operating_mode` | Mode raw code and text label (`idle` / `charge` / `discharge` / `voltage_protection` / `unknown`) |
 | `cycle_count`, `discharge_ah_count` | Lifetime counters |
 | `rssi`, `rssi_quality_pct`, `rssi_quality` | BLE signal |
 | `ble_mac`, `ble_name` | BLE device info |
 
 **Pack / system aggregate** (`ble_battery/<battery_system_name>/`):
 
-`pack_voltage_mv`, `pack_current_ma`, `pack_power_w`, `pack_soc`, `pack_capacity_ah`, `pack_remain_ah`, `series_group_voltage_delta_mv`, `slot_voltage_delta_mv`, `pack_cell_delta_max_mv`, `pack_cell_min_mv`, `pack_cell_balancer_status`, `pack_series_balancer_status`, `group_1/voltage_mv` … (per-group sub-topics), `topology`, `topology_reporting`, `topology_complete`
+`pack_voltage_v`, `pack_voltage_internal_v`, `pack_current_a`, `pack_power_w`, `pack_soc`, `pack_capacity_ah`, `pack_remain_ah`, `series_group_voltage_delta_mv`, `slot_voltage_delta_mv`, `pack_cell_delta_max_mv`, `pack_cell_min_mv`, `pack_cell_balancer_status`, `pack_series_balancer_status`, `operating_mode_raw`, `operating_mode` (max raw across active batteries → text), `victron_balancer_active`, `victron_balancer_alarm`, `victron_balancer_status`, `group_1/voltage_v`, `group_1/current_a` … (per-group sub-topics), `topology`, `topology_reporting`, `topology_complete`
+
+`pack_voltage_v` is the pole/terminal sum (what loads see); `pack_voltage_internal_v` is the BMS-internal cell-sum aggregation. Compare them to spot MOSFET-off events or large drops under load.
 
 **Gateway health** (`ble_battery/esp32-battery-bridge/`):
 
@@ -125,7 +130,7 @@ To remove stale entities: delete the retained discovery config topics in an MQTT
 | `status_flags` | 68 | u32 LE | bitfield | Bit `0x80` = discharge path locked (OFF) |
 | `protect_state` | 76 | u8 (LSB of u32) | code | |
 | `equil_state` | 84 | u8 (LSB of u32) | bitmask | `1`=cell1, `2`=cell2, `4`=cell3, `8`=cell4 (heuristic) |
-| `operating_mode` | 88 | u16 LE | code | `0`=idle, `1`=charge, `2`=discharge |
+| `operating_mode` | 88 | u16 LE | code | `0`=idle, `1`=charge, `2`=discharge, `4`=voltage_protection (see legend below) |
 | `soc` | 90 | u8 (LSB of u16) | % | |
 | `soh` | 92 | u8 (LSB of u16) | % | |
 | `cycle_count` | 96 | u32 LE | count | Primary; fallback to u16@66 if implausible |
@@ -162,6 +167,30 @@ To remove stale entities: delete the retained discovery config topics in an MQTT
 | ≤ 120 mV | `warning` |
 | > 120 mV | `critical` |
 
+### Operating Mode Codes
+
+| Code | Label                | Notes |
+|------|----------------------|-------|
+| 0    | `idle`               | |
+| 1    | `charge`             | |
+| 2    | `discharge`          | |
+| 4    | `voltage_protection` | Observed when a 12 V LFP battery in a 24 V series string hit ~15 V — generic voltage-rail protection trip (over- or under-voltage). |
+| else | `unknown`            | Not yet identified — please report. |
+
+The pack-aggregate device exposes `operating_mode_raw` / `operating_mode` derived from `max()` of the per-battery raw codes, so a single battery in protection surfaces at the pack level.
+
+### Victron Battery Balancer (24 V) Integration
+
+If you have a Victron BatteryBalancer wired across two 12 V batteries in series, the pack device exposes three entities that mirror the real device's behavior:
+
+| Entity                       | Meaning |
+|------------------------------|---------|
+| `victron_balancer_active`    | `true` while pack > 27.3 V (balancer is shunting) |
+| `victron_balancer_alarm`     | `true` once group spread > 200 mV; clears at < 140 mV or pack < 26.6 V (matches Victron alarm relay hysteresis) |
+| `victron_balancer_status`    | `n/a` / `below_activation` / `balancing_idle` / `balancing_active` / `alarm` |
+
+Spread input: `series_group_voltage_delta_mv`. Only meaningful when `battery_system_topology` is exactly two series groups (e.g. `1-2`, `12-34`, `123-456`); reports `n/a` otherwise. Sources: [Victron Battery Balancer product page](https://www.victronenergy.com/batteries/battery-balancer).
+
 ### Parser Fallback Rules
 
 - `cycle_count`: primary `u32@96`; falls back to `u16@66` if primary is 0 or ≥ 1,000,000
@@ -173,7 +202,7 @@ The following are partially reverse-engineered and may vary by firmware version:
 
 - `u32@12` — secondary voltage; exact semantics unclear
 - `equil_state@84` bitmask — heuristic cell-index mapping, not final
-- `operating_mode@88` full code table — `0/1/2` confirmed; higher values unknown
+- `operating_mode@88` full code table — `0/1/2/4` mapped (see Operating Mode Codes); other values not yet identified
 - Flag details in bytes 62–75 and 80–83
 
 Protocol confirmed on LiTime and PowerQueen samples; Redodo assumed compatible (same family).
