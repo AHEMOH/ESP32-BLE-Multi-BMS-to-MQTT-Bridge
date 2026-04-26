@@ -2796,6 +2796,18 @@ script:
             if (!icon.empty()) {
               payload += ",\"icon\":\"" + icon + "\"";
             }
+            // Tell HA how many decimals to render for known units; without this,
+            // HA's MQTT integration may strip trailing zeros and show e.g. "26" for "26.000".
+            int precision = -1;
+            if (unit == "V") precision = 3;
+            else if (unit == "A") precision = 2;
+            else if (unit == "W") precision = 1;
+            else if (unit == "%") precision = 1;
+            else if (unit == "Ah") precision = 1;
+            else if (unit == "mV" || unit == "mA" || unit == "°C" || unit == "dBm") precision = 0;
+            if (precision >= 0) {
+              payload += ",\"suggested_display_precision\":" + esphome::to_string(precision);
+            }
 
             payload += "}";
             id(mqtt_client).publish(cfg_topic, payload, 0, true);
