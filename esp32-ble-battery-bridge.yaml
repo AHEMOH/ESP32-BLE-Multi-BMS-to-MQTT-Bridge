@@ -32,12 +32,12 @@ substitutions:
   # mac    = BLE address; empty = auto-bind by name (stored in NVS flash)
   # enabled = "true" / "false"  — slot is active when enabled=true AND name is not empty
 
-  bms1_name: "P-12100BNNA70-XXXXXX"
-  bms1_mac: "XX:XX:XX:XX:XX:XX"
+  bms1_name: !secret bms1_name
+  bms1_mac: !secret bms1_mac
   bms1_enabled: "true"
 
-  bms2_name: "L-12100BNNA70-XXXXXX"
-  bms2_mac: "XX:XX:XX:XX:XX:XX"
+  bms2_name: !secret bms2_name
+  bms2_mac: !secret bms2_mac
   bms2_enabled: "true"
 
   bms3_name: ""
